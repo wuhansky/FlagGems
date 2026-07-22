@@ -125,6 +125,11 @@ PYBIND11_MODULE(c_operators, m) {
   m.def("rwkv_ka_fusion", &flag_gems::rwkv_ka_fusion);
   m.def("copy_", &flag_gems::copy_);
   m.def("to_copy", &flag_gems::to_copy);
+  // adaptive_max_pool3d global pool fast path (CANN kernel bypass)
+  m.def("capture_native_kernels", &flag_gems::capture_native_kernels);
+  m.def("adaptive_max_pool3d_global", &flag_gems::adaptive_max_pool3d_global);
+  /* fp8_matmul currently not compiled (fp8_matmul.cpp excluded from CMakeLists.txt);
+     comment out pybind11 bindings to avoid undefined-symbol errors when loading c_operators.so.
   m.def("fp8_matmul",
         &flag_gems::fp8_matmul,
         py::arg("a"),
@@ -139,6 +144,7 @@ PYBIND11_MODULE(c_operators, m) {
         py::arg("b"),
         py::arg("b_s"),
         py::arg("scale_dtype") = at::kFloat);
+  */
 }
 namespace flag_gems {
 TORCH_LIBRARY(flag_gems, m) {
@@ -352,4 +358,5 @@ TORCH_LIBRARY_IMPL(flag_gems, FLAGGEMS_DISPATCH_KEY, m) {
   m.impl("to_copy", TORCH_FN(to_copy));
   m.impl("copy_", TORCH_FN(copy_));
 }
+
 }  // namespace flag_gems

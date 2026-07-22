@@ -6,6 +6,7 @@ add_library(operators
             utils.cpp
             sum.cpp
             max.cpp
+            adaptive_max_pool3d.cpp
             mm.cpp
             rms_norm.cpp
             gemma_rms_norm.cpp
@@ -28,8 +29,9 @@ add_library(operators
             rwkv_ka_fusion.cpp
             copy.cpp
             accuracy_utils.cpp
-            fp8_matmul.cpp
-            fp8_matmul_direct.cpp)
+            # fp8_matmul.cpp
+            # fp8_matmul_direct.cpp
+            )
 
 if (TRITON_GE_3P5)
   target_compile_definitions(operators PRIVATE TRITON_GE_3P5)

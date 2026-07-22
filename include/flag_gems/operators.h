@@ -257,4 +257,24 @@ at::Tensor to_copy(const at::Tensor &self,
 
 at::Tensor &copy_(at::Tensor &dst, const at::Tensor &src, bool non_blocking = false);
 
+// ---------------------------------------------------------------------------
+// adaptive_max_pool3d global pool fast path (CANN kernel bypass)
+//
+// capture_native_kernels() must be called during initialization (from Python
+// flag_gems/__init__.py) BEFORE the first torch.library.Library("aten", "IMPL")
+// is created.  It stores handles to CANN native kernels so that
+// adaptive_max_pool3d_global() can call them directly via callBoxed(),
+// bypassing the PyTorch dispatcher entirely.
+//
+// adaptive_max_pool3d_cpp() is the AutogradPrivateUse1 interceptor ��
+// registered via TORCH_LIBRARY_IMPL(aten, AutogradPrivateUse1, m) to
+// intercept aten::adaptive_max_pool3d BEFORE FlagGems' Python handler on
+// PrivateUse1.  Global pool is handled directly in C++ (bypassing Python
+// entirely); non-global-pool shapes are redispatched to PrivateUse1.
+// ---------------------------------------------------------------------------
+void capture_native_kernels();
+std::tuple<at::Tensor, at::Tensor> adaptive_max_pool3d_global(const at::Tensor &self);
+std::tuple<at::Tensor, at::Tensor> adaptive_max_pool3d_cpp(
+    const at::Tensor &self, at::IntArrayRef output_size);
+
 }  // namespace flag_gems

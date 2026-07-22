@@ -1,3 +1,4 @@
+from .adaptive_max_pool3d import adaptive_max_pool3d
 from .addmm import addmm
 from .all import all, all_dim, all_dims
 from .amax import amax
@@ -90,6 +91,7 @@ from .zeros_like import zeros_like
 __all__ = [
     "_unique2",
     "_upsample_bicubic2d_aa",
+    "adaptive_max_pool3d",
     "addmm",
     "all",
     "all_dim",

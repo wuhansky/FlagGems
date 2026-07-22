@@ -31,6 +31,55 @@ except ImportError:
 device = runtime.device.name
 vendor_name = runtime.device.vendor_name
 backend_info = runtime.device
+
+# ---------------------------------------------------------------------------
+# Capture CANN native kernels BEFORE creating aten_lib.
+#
+# When flag_gems.use_gems() creates a second torch.library.Library("aten",
+# "IMPL"), any SafeKernelFunction handles captured *after* the first Library
+# was created become invalid.  By capturing them *before* the first Library,
+# the handles survive library creation and remain callable via call_boxed()
+# throughout the session �� even inside use_gems() contexts.
+#
+# This mechanism lets FlagGems ops bypass their own Triton dispatch and
+# call the original CANN (aclnn) kernel directly, for cases where the CANN
+# kernel is significantly faster (e.g. values?only reduction vs indices
+# computation in npu_max).
+# ---------------------------------------------------------------------------
+_NATIVE_CANN_KERNELS = {}
+_NATIVE_CANN_KEYSETS = {}
+
+try:
+    import torch_npu  # ensure PrivateUse1 kernels are registered
+except ImportError:
+    torch_npu = None
+
+if torch_npu is not None:
+    _PU1_KEY = torch._C.DispatchKey.PrivateUse1
+    _PU1_KEYSET = torch._C.DispatchKeySet(_PU1_KEY)
+    # Ops for which we may want the CANN native kernel
+    for _op_name in ("aten::amax",):
+        try:
+            _k = torch.library.get_kernel(_op_name, _PU1_KEY)
+            if _k is not None:
+                _NATIVE_CANN_KERNELS[_op_name] = _k
+                _NATIVE_CANN_KEYSETS[_op_name] = _PU1_KEYSET
+        except Exception:
+            pass
+
+    # -------------------------------------------------------------------
+    # Also capture CANN kernels in C++ for adaptive_max_pool3d fast path.
+    # The C++ capture stores KernelFunction handles that can call CANN
+    # kernels directly via callBoxed(), bypassing the PyTorch dispatcher
+    # and Python call_boxed overhead entirely (~3 ��s savings).
+    # -------------------------------------------------------------------
+    try:
+        from flag_gems import c_operators
+        if hasattr(c_operators, "capture_native_kernels"):
+            c_operators.capture_native_kernels()
+    except Exception:
+        pass
+
 aten_lib = torch.library.Library("aten", "IMPL")
 
 # Register all ops in the current backend with SpecOpRegistrar to support architecture-specialized implementations
@@ -799,11 +848,17 @@ def enable(
     """
     global current_work_registrar
     exclude_ops = resolve_user_setting(unused, "exclude")
+    # Suppress the amax Python handler so that torch.amax falls through
+    # to the fast CANN native kernel.  This is needed by the global-pool
+    # path in adaptive_max_pool3d.  We do NOT suppress max.dim/max.dim_max
+    # because CANN native aclnnMaxDim lacks INT16 support; the Python
+    # handler covers those dtypes.
+    _extra_cpp_patched = {"amax"}
     current_work_registrar = registrar(
         _FULL_CONFIG,
         user_include_ops=[],
         user_exclude_ops=exclude_ops,
-        cpp_patched_ops=list(set(aten_patch_list)),
+        cpp_patched_ops=list(set(aten_patch_list) | _extra_cpp_patched),
         lib=lib,
     )
     setup_flaggems_logging(path=path, record=record, once=once)
@@ -853,11 +908,12 @@ def only_enable(
         return
 
     global current_work_registrar
+    _extra_cpp_patched = {"amax"}
     current_work_registrar = registrar(
         _FULL_CONFIG,
         user_include_ops=include_ops,
         user_exclude_ops=[],
-        cpp_patched_ops=list(set(aten_patch_list)),
+        cpp_patched_ops=list(set(aten_patch_list) | _extra_cpp_patched),
         full_config_by_func=FULL_CONFIG_BY_FUNC,
         lib=lib,
     )

@@ -196,7 +196,7 @@ namespace backend {
 #if defined(FLAGGEMS_USE_CUDA) || defined(FLAGGEMS_USE_IX)
     return torch::cuda::is_available();
 #elif defined(FLAGGEMS_USE_NPU)
-    return torch::custom_class_available("npu");
+    return c10::is_privateuse1_backend_registered();
 #elif defined(FLAGGEMS_USE_MUSA)
     return true;
 #elif defined(FLAGGEMS_USE_GCU)

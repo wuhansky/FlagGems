@@ -66,4 +66,15 @@ TORCH_LIBRARY_IMPL(aten, FLAGGEMS_DISPATCH_KEY, m) {
   REGISTER_AND_LOG("nonzero", nonzero);
 }
 
+TORCH_LIBRARY_IMPL(aten, AutogradPrivateUse1, m) {
+  // Register at AutogradPrivateUse1 (priority 147) to intercept BEFORE
+  // CompositeExplicitAutogradNonFunctional decomposition (priority 165).
+  //
+  // PR #4488 pattern: use bare m.impl() (NOT REGISTER_AND_LOG) so the
+  // Python/Warm/Triton handler at PrivateUse1 is NOT suppressed.  The C++
+  // handler is a THIN interceptor that only prevents composite decomposition
+  // and redispatches; the core algorithm stays in Python.
+  m.impl("adaptive_max_pool3d", TORCH_FN(adaptive_max_pool3d_cpp));
+}
+
 }  // namespace flag_gems

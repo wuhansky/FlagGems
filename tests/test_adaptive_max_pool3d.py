@@ -564,6 +564,11 @@ EMPTY_CONFIGS = [
 @pytest.mark.adaptive_max_pool3d
 @pytest.mark.parametrize("shape, output_size, desc", EMPTY_CONFIGS)
 @pytest.mark.parametrize("dtype", FLOAT_DTYPES)
+@pytest.mark.xfail(
+    condition=(flag_gems.device == "npu"),
+    reason="NPU Ascend operator aclnnAdaptiveMaxPool3d does not support output_size with dimension 0",
+    strict=False,
+)
 def test_accuracy_adaptive_max_pool3d_empty_output(shape, output_size, desc, dtype):
     """Empty output tensor handling (zero in output_size)."""
     inp = torch.randn(shape, dtype=dtype, device=flag_gems.device)
