@@ -19,7 +19,6 @@ from .broadcast_tensors import broadcast_tensors
 from .broadcast_to import broadcast_to
 from .conv_transpose1d import conv_transpose1d, conv_transpose1d_output_size
 from .cudnn_batch_norm_backward import cudnn_batch_norm_backward, make_3d_for_bn
-from .cudnn_convolution import cudnn_convolution
 from .diagonal_scatter import diagonal_scatter
 from .embedding_dense_backward import embedding_dense_backward
 from .gcd_ import gcd, gcd_
@@ -65,7 +64,6 @@ __all__ = [
     "conv_transpose1d",
     "conv_transpose1d_output_size",
     "cudnn_batch_norm_backward",
-    "cudnn_convolution",
     "diagonal_scatter",
     "embedding_dense_backward",
     "gcd",
