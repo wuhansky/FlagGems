@@ -64,6 +64,11 @@ logger = logging.getLogger(__name__)
 # FMA-based direct kernel on bf16/f16 (see the dispatch comment below).
 _DIRECT_MAX_C = 8
 
+# tl.dot's minimum contraction length (K). Backends enforce it strictly - the
+# CoreX/iluvatar compiler rejects any dot with K < 16 - so a GEMM path must
+# never be handed fewer than this many reduction elements.
+_DOT_MIN_K = 16
+
 
 def _to_list(param, ndim):
     """Broadcast a scalar spatial parameter to one entry per spatial dimension."""
@@ -819,12 +824,17 @@ def cudnn_convolution(
     # Dedicated pointwise GEMM for 1x1 convolutions with a single group. Only
     # valid when there is no padding: a padded 1x1 conv has a larger output
     # spatial extent (zero-padded border), which the plain GEMM does not model.
+    # A 1x1 kernel makes that GEMM's K exactly C_in (the kernel taps are all 1),
+    # so a small C_in would hand tl.dot fewer than its minimum K; below that
+    # floor fall through to the FMA direct kernel below, which reduces over
+    # C_in * KH * KW without a dot.
     if (
         groups == 1
         and all(k == 1 for k in weight.shape[2:])
         and all(s == 1 for s in stride)
         and all(d == 1 for d in dilation)
         and all(p == 0 for p in padding)
+        and weight.shape[1] >= _DOT_MIN_K
     ):
         return _pointwise_conv(input, weight, ndim)
 
@@ -841,7 +851,7 @@ def cudnn_convolution(
     # Measured: for a grouped C_in=12 case the direct kernel wins at fp32
     # (0.44 -> 1.14) but loses badly at bf16/f16 (1.67 -> 1.18, 1.46 -> 0.85),
     # so the C_in <= 8 bound is where FMA overtakes the padded tensor-core dot.
-    if weight.shape[1] < 16:
+    if weight.shape[1] < _DOT_MIN_K:
         if input.dtype == torch.float32 or weight.shape[1] <= _DIRECT_MAX_C:
             if ndim == 3:
                 return _direct_conv3d(input, weight, padding, stride, dilation, groups)

@@ -26,6 +26,7 @@ from .broadcast_to import broadcast_to
 from .cholesky_solve import cholesky_solve, cholesky_solve_out
 from .conv_depthwise2d import _conv_depthwise2d
 from .conv_transpose1d import conv_transpose1d
+from .cudnn_convolution import cudnn_convolution
 from .diagonal_scatter import diagonal_scatter
 from .div import div_mode, div_mode_
 from .gcd_ import gcd_
@@ -93,6 +94,7 @@ __all__ = [
     "cholesky_solve",
     "cholesky_solve_out",
     "conv_transpose1d",
+    "cudnn_convolution",
     "diagonal_scatter",
     "div_mode",
     "div_mode_",
