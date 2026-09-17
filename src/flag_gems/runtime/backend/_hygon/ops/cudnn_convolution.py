@@ -14,23 +14,17 @@
 
 """hygon override of :func:`flag_gems.ops.cudnn_convolution`.
 
-Two problems are addressed here, both on the hygon backend only.
+The generic dispatch is used unchanged except for host time, which is the only
+problem addressed here.
 
-1. AABS. FlagTree's auto-adjusted block sizes are consumed by Triton's
-   autotuner (``triton/runtime/autotuner.py``) and pair the block names up
-   wrongly for every convolution kernel in this op: ``BLOCK_NI_HO_WO`` is fed
-   ``in_n`` and collapses to ``next_power_of_2(in_n)``, ``BLOCK_SP`` is fed the
-   raw spatial extent. Measured with ``do_bench`` on the shipped kernels,
-   AABS on -> off::
+FlagTree AABS used to be addressed here too. It is now held off by the generic
+op itself -- see ``_aabs_disabled`` in flag_gems/ops/cudnn_convolution.py, which
+documents the mispairing and its measurements. The mispairing is a property of
+the convolution kernels rather than of this backend, so the guard moved next to
+them. This file still needs the helper because it launches its own conv2d kernel
+below, autotuned from the same configs.
 
-     (16, 32, 56, 56)   k3 g32  fp16   0.165 -> 1.622   (9.9x)
-     (2, 4, 16, 16, 16) k3      fp32   0.048 -> 0.945   (19.7x)
-     (8, 256, 64, 64)   k3      fp16   0.038 -> 0.307   (8.1x)
-     (32, 64, 128, 128) k3      fp32   0.229 -> 0.631   (2.8x)
-     (16, 32, 1024)     k3 g32  fp16   0.138 -> 0.330   (2.4x)
-     (8, 3, 224, 224)   k3      fp16   1.083 -> 1.103   (unchanged)
-
-2. Host time. Splitting each benchmark row into host and device time
+Host time. Splitting each benchmark row into host and device time
    (``do_bench`` vs a CUDA-graph replay of the same call) puts 26 of 66 rows at
    a mean speedup of 0.49 with 60-135 us of host time each, while their *device*
    time already beats MIOpen's. The convolution kernels are small, so the host
@@ -71,7 +65,6 @@ Only the tl.dot path (1d and 2d) is routed here; depthwise, pointwise,
 direct-FMA and 3d fall through to the generic op.
 """
 
-import contextlib
 import copy
 import logging
 import math
@@ -80,45 +73,19 @@ import torch
 import triton
 import triton.language as tl
 
-try:
-    from triton.knobs import autotuning as _autotuning_knobs
-except (ImportError, ModuleNotFoundError):
-    # Triton < 3.6 does not have triton.knobs, where AABS does not exist either.
-    _autotuning_knobs = None
-
 from flag_gems import runtime
 from flag_gems.ops.conv2d import Conv2d as _GenericConv2d
-from flag_gems.ops.cudnn_convolution import _DIRECT_MAX_C, _DOT_MIN_K, _to_list
+from flag_gems.ops.cudnn_convolution import (
+    _DIRECT_MAX_C,
+    _DOT_MIN_K,
+    _aabs_disabled,
+    _to_list,
+)
 from flag_gems.ops.cudnn_convolution import (
     cudnn_convolution as _generic_cudnn_convolution,
 )
 
 logger = logging.getLogger(__name__)
-
-_UNSET = object()
-
-
-@contextlib.contextmanager
-def _aabs_disabled():
-    """Hold FlagTree AABS off for the duration of the launch.
-
-    The knob is an env_bool descriptor whose __set__ also writes os.environ on
-    every store, making a set/restore pair ~5.6us; its __get__ prefers the
-    instance dictionary, so writing there instead is enough (autotuner.py reads
-    it as ``knobs.autotuning.adjust_block_size``) and costs ~0.3us. Any
-    FLAGTREE_AABS in the environment is left alone and takes over again as soon
-    as the entry is removed.
-    """
-    state = _autotuning_knobs.__dict__
-    previous = state.get("adjust_block_size", _UNSET)
-    state["adjust_block_size"] = False
-    try:
-        yield
-    finally:
-        if previous is _UNSET:
-            state.pop("adjust_block_size", None)
-        else:
-            state["adjust_block_size"] = previous
 
 
 def conv2d_output_size(
@@ -688,24 +655,11 @@ def cudnn_convolution(
 
     Routes the tl.dot convolution path (1d and 2d) through the kernel defined in
     this file and leaves every other path to the generic implementation. See the
-    module docstring for why.
+    module docstring for why. The generic op holds AABS off for its own dispatch;
+    the helper is imported so this file can hold it off again around the kernel
+    below, which is autotuned from the same configs.
     """
     logger.debug("GEMS_HYGON CUDNN_CONVOLUTION")
-
-    # triton.knobs is unavailable on Triton < 3.6, where AABS does not exist
-    # either, and without tuned configs there is nothing to autotune.
-    if _autotuning_knobs is None or not _CONV2D_FORWARD_CONFIGS:
-        return _generic_cudnn_convolution(
-            input,
-            weight,
-            padding,
-            stride,
-            dilation,
-            groups,
-            benchmark,
-            deterministic,
-            allow_tf32,
-        )
 
     ndim = input.ndim - 2
     if ndim in (1, 2):
@@ -715,37 +669,40 @@ def cudnn_convolution(
         stride = _to_list(stride, ndim)
         dilation = _to_list(dilation, ndim)
 
-    with _aabs_disabled():
-        if ndim in (1, 2) and _uses_conv2d_forward_path(
+        # Without tuned configs there is nothing to autotune, so the private
+        # kernel below has nothing to offer over the generic one.
+        if _CONV2D_FORWARD_CONFIGS and _uses_conv2d_forward_path(
             input, weight, padding, stride, dilation, groups
         ):
-            if ndim == 1:
-                return _hygon_conv1d(
+            with _aabs_disabled():
+                if ndim == 1:
+                    return _hygon_conv1d(
+                        input,
+                        weight,
+                        bias=None,
+                        stride=stride[0],
+                        padding=padding[0],
+                        dilation=dilation[0],
+                        groups=groups,
+                    )
+                return _hygon_conv2d(
                     input,
                     weight,
                     bias=None,
-                    stride=stride[0],
-                    padding=padding[0],
-                    dilation=dilation[0],
+                    stride=stride,
+                    padding=padding,
+                    dilation=dilation,
                     groups=groups,
                 )
-            return _hygon_conv2d(
-                input,
-                weight,
-                bias=None,
-                stride=stride,
-                padding=padding,
-                dilation=dilation,
-                groups=groups,
-            )
-        return _generic_cudnn_convolution(
-            input,
-            weight,
-            padding,
-            stride,
-            dilation,
-            groups,
-            benchmark,
-            deterministic,
-            allow_tf32,
-        )
+
+    return _generic_cudnn_convolution(
+        input,
+        weight,
+        padding,
+        stride,
+        dilation,
+        groups,
+        benchmark,
+        deterministic,
+        allow_tf32,
+    )

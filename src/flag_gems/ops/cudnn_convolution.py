@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import logging
 
 import torch
@@ -22,7 +23,87 @@ from flag_gems.ops.conv1d import conv1d
 from flag_gems.ops.conv2d import conv2d
 from flag_gems.ops.conv3d import conv3d
 
+try:
+    from triton.knobs import autotuning as _autotuning_knobs
+except (ImportError, ModuleNotFoundError):
+    # Triton < 3.6 has no triton.knobs module, and so no AABS either.
+    _autotuning_knobs = None
+
 logger = logging.getLogger(__name__)
+
+_UNSET = object()
+
+# Whether the running Triton fork ships FlagTree's AABS knob. Probed once at
+# import: it is a property of the installed fork, not of any individual call.
+_AABS_PRESENT = _autotuning_knobs is not None and hasattr(
+    _autotuning_knobs, "adjust_block_size"
+)
+
+
+@contextlib.contextmanager
+def _aabs_disabled():
+    """Hold FlagTree AABS off for the duration of an operator dispatch.
+
+    AABS (auto_adjust_block_sizes) rewrites the autotuned block sizes at launch
+    time, shrinking any BLOCK that exceeds the tensor extent it was paired with
+    to next_power_of_2(extent). It pairs a block to an extent by matching the
+    ``tl.cdiv(extent, BLOCK)`` it sees against the kernel's argument names, and
+    that pairing is wrong for every convolution kernel this operator launches:
+    they tile the *flattened* spatial volume
+    ``in_n * out_d * out_h * out_w``, but the analyzer keys the block to ``in_n``
+    alone, so the tile collapses to next_power_of_2(in_n). Measured on the
+    shipped kernels, AABS on -> off::
+
+        (16, 32, 56, 56)    k3 g32  fp16     0.165 -> 1.622   (9.9x)
+        (2, 4, 16, 16, 16)  k3      fp32     0.048 -> 0.945   (19.7x)
+        (8, 256, 64, 64)    k3      fp16     0.038 -> 0.307   (8.1x)
+        (32, 64, 128, 128)  k3      fp32     0.229 -> 0.631   (2.8x)
+        (16, 32, 1024)      k3 g32  fp16     0.138 -> 0.330   (2.4x)
+        (8, 3, 224, 224)    k3      fp16     1.083 -> 1.103   (unchanged)
+
+    The collapse is fatal rather than merely slow on backends whose tensor-core
+    tiles need M >= 16 rows: the shrunk M = 2 dot cannot be lowered and the
+    kernel aborts while lowering the dot result's ``ttg.convert_layout``,
+    surfacing as "RuntimeError: PassManager::run failed" from the mlir->llir
+    stage. On the 3D core case (2, 16, 16, 16, 16) ``BLOCK_NI_DO_HO_WO`` goes
+    512 -> 2 that way. Only some backends have a branch in
+    triton/runtime/adjust_kernel_param.py that bumps such a tile back up to the
+    dot floor, so on the others whatever AABS shrinks stays shrunk.
+
+    The pairing lives in the Triton fork, not in any backend, which makes this a
+    property of *this operator's kernels* rather than of a platform -- hence the
+    guard below is a capability probe on the knob, never a check on which backend
+    is running. Vanilla Triton >= 3.6 ships ``triton.knobs`` but no AABS at all,
+    and there the probe short-circuits.
+
+    The knob is global state read at launch time, so holding it off around the
+    whole dispatch is what covers every kernel the operator launches -- including
+    the nested conv1d/conv2d/conv3d autotuners and conv2d's backward pass, which
+    passes ``out_grad.shape[0]`` as the same ``in_n`` argument. The save/restore
+    keeps every other operator's autotuning untouched.
+    """
+    if not _AABS_PRESENT:
+        # No AABS to hold off: Triton < 3.6 has no knobs module, and vanilla
+        # Triton >= 3.6 has the module but not the knob. Callers that launch
+        # kernels in bulk skip the manager outright (see the dispatch below).
+        yield
+        return
+
+    # The knob is a descriptor whose __set__ also writes os.environ on every
+    # store, making a set/restore pair ~5.6us; its __get__ prefers the instance
+    # dictionary, so writing there instead is enough (~0.3us) and is what the
+    # autotuner reads. Any FLAGTREE_AABS in the environment is left alone and
+    # takes over again as soon as the entry is removed.
+    state = _autotuning_knobs.__dict__
+    previous = state.get("adjust_block_size", _UNSET)
+    state["adjust_block_size"] = False
+    try:
+        yield
+    finally:
+        if previous is _UNSET:
+            state.pop("adjust_block_size", None)
+        else:
+            state["adjust_block_size"] = previous
 
 
 # ---------------------------------------------------------------------------
@@ -812,9 +893,27 @@ def cudnn_convolution(
             f"cudnn_convolution only supports 1D, 2D, and 3D convolutions, "
             f"got input with {ndim} spatial dimensions"
         )
+
     padding = _to_list(padding, ndim)
     stride = _to_list(stride, ndim)
     dilation = _to_list(dilation, ndim)
+
+    # AABS mispairs the block sizes of every kernel this operator launches, and
+    # the knob is read at launch time, so it has to be held off around the whole
+    # dispatch rather than around any single launch (see _aabs_disabled). Where
+    # the fork has no such knob the branch below skips the manager outright: its
+    # ~1.2us of host time is itself visible in the latency of the small
+    # convolutions this op mostly runs.
+    if _AABS_PRESENT:
+        with _aabs_disabled():
+            return _conv_forward(input, weight, padding, stride, dilation, groups)
+    return _conv_forward(input, weight, padding, stride, dilation, groups)
+
+
+def _conv_forward(input, weight, padding, stride, dilation, groups):
+    """Pick and run the convolution path. ``padding``/``stride``/``dilation``
+    are per-spatial-dimension lists by the time this runs."""
+    ndim = input.ndim - 2
 
     # Dedicated depthwise kernel: no cross-channel reduction, avoids the
     # channel-to-16 padding that the generic tl.dot path would otherwise do.
@@ -883,7 +982,7 @@ def cudnn_convolution(
             dilation=dilation,
             groups=groups,
         )
-    elif ndim == 3:
+    else:  # ndim == 3, the only remaining value the caller admits
         return conv3d(
             input,
             weight,
@@ -892,9 +991,4 @@ def cudnn_convolution(
             padding=padding,
             dilation=dilation,
             groups=groups,
-        )
-    else:
-        raise ValueError(
-            f"cudnn_convolution only supports 1D, 2D, and 3D convolutions, "
-            f"got input with {ndim} spatial dimensions"
         )

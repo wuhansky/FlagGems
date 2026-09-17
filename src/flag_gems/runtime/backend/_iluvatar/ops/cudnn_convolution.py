@@ -20,12 +20,6 @@ import torch
 import triton
 import triton.language as tl
 
-try:
-    from triton.knobs import autotuning as _autotuning_knobs
-except (ImportError, ModuleNotFoundError):
-    # Triton < 3.6 does not have triton.knobs module
-    _autotuning_knobs = None
-
 from flag_gems.ops.cudnn_convolution import (
     cudnn_convolution as _generic_cudnn_convolution,
 )
@@ -211,10 +205,7 @@ def _dot_conv2d_kernel(
             acc = tl.dot(x, w, acc=acc, out_dtype=tl.float32)
 
     out_mask = (
-        oc_valid[None, :]
-        & (n < N)[:, None]
-        & (oh < OH)[:, None]
-        & (ow < OW)[:, None]
+        oc_valid[None, :] & (n < N)[:, None] & (oh < OH)[:, None] & (ow < OW)[:, None]
     )
     out_ptr = (
         output_ptr
@@ -326,52 +317,29 @@ def _tab_kernel_replaced():
 
 
 # ---------------------------------------------------------------------------
-# FlagTree AABS (auto_adjust_block_sizes) is held off for this operator.
+# FlagTree AABS (auto_adjust_block_sizes) is held off by the generic op now --
+# see ``_aabs_disabled`` in flag_gems/ops/cudnn_convolution.py, which documents
+# the mispairing and its measurements. It used to be duplicated here; it is a
+# property of the convolution kernels rather than of this backend, so one copy
+# in the operator's own implementation covers every backend.
 #
-# AABS rewrites the autotuned block sizes at benchmark time from the *actual*
-# tensor extents, shrinking any BLOCK that exceeds the extent it was paired
-# with to next_power_of_2(extent). It pairs blocks by matching the tl.cdiv the
-# analyzer sees against the kernel's argument names, and that pairing is wrong
-# for every convolution kernel here:
-#
-#   conv2d_forward_kernel     BLOCK_NI_HO_WO <- in_n
-#       The block tiles the flattened in_n * out_height * out_width space, but
-#       the analyzer keys it to in_n alone, so the tile collapses to
-#       next_power_of_2(in_n). Measured on the shipped config list:
-#           in_n = 32  ->  BLOCK_NI_HO_WO 64 => 32
-#       which hides the wide tiles that actually win on the large-spatial
-#       shapes.
-#
-#   _depthwise_conv_kernel    BLOCK_SP <- the raw spatial extent
-#       Keyed to a single extent while the block spans the whole tensor.
-#       Measured: (16, 32, 1024) k3 g32 goes 105 us -> 12 us once AABS is off
-#       (speedup 0.40 -> 3.33), and (16, 32, 56, 56) k3 g32 413 us -> 45 us
-#       (speedup 0.27 -> 2.46).
-#
-# Shrinking is also a hard failure mode here. Below 16 the CoreX TLE pass
-# cannot lower the kernel:
+# The failure mode was worse here than slow. Below 16 the CoreX TLE pass cannot
+# lower the kernel:
 #
 #   LLVM ERROR: Invalid basis N for in-dim 'offset' and out-dim 'dim0'.
 #               Basis must be less than the out-dim size.
 #
 # surfacing as "RuntimeError: PassManager::run failed", which aborts the
-# process rather than raising a catchable compile error. in_n = 2, 3, 4, 6, 8
+# process rather than raising a catchable compile error; in_n = 2, 3, 4, 6, 8
 # all abort. Only the backends listed in triton/runtime/adjust_kernel_param.py
 # bump such a tile back up to the dot floor afterwards ("" / hcu / sunrise);
 # iluvatar has no such branch, so whatever AABS shrinks stays shrunk.
 #
-# AABS is therefore a pure loss for this operator: it hides the tiles that
-# actually win and can abort the process outright. The knob is global state
-# read at launch time, so holding it off for the whole dispatch covers every
-# kernel this operator launches -- including conv2d's backward pass (which
-# passes out_grad.shape[0] as the same in_n argument) -- and the save/restore
-# in the context manager keeps every other operator's autotuning untouched.
-#
 # Measured on benchmark/test_cudnn_convolution.py, mean gems speedup over the
-# torch baseline across the 66 comprehensive rows. The AABS fix alone took it
-# 0.6146 -> 0.891 (three runs: 0.9064 / 0.8901 / 0.8772, a +-0.015 spread that
-# straddles the 0.9 bar). Adding the tap-packed kernel above took it to 0.9735
-# and 0.9767 on two runs -- bf16 1.085/1.089, fp16 1.052/1.059, fp32
+# torch baseline across the 66 comprehensive rows. Holding AABS off alone took
+# it 0.6146 -> 0.891 (three runs: 0.9064 / 0.8901 / 0.8772, a +-0.015 spread
+# that straddles the 0.9 bar). Adding the tap-packed kernel above took it to
+# 0.9735 and 0.9767 on two runs -- bf16 1.085/1.089, fp16 1.052/1.059, fp32
 # 0.784/0.782, with 27/66 rows at or above 0.9 in both, against 21-22 before.
 # The spread tightened to 0.003 as well.
 #
@@ -384,13 +352,13 @@ def _tab_kernel_replaced():
 # BLOCK_CI = 16 only covers half of a C_in of 32 and would otherwise produce
 # silently wrong results.
 #
-# Rejected on top of the AABS fix:
+# Rejected:
 #
 #   * Widening the conv2d_forward tuning list with BLOCK_NI_HO_WO = 512 tiles.
 #     The shipped list tops out at 256. Appending the wide tiles to the shared
 #     Autotuner gave 0.9004 and giving this operator its own copy of the kernel
-#     with them baked in gave 0.8967 -- neither better than the AABS fix alone
-#     -- while the private copy costs 5x the wall clock (a new kernel identity
+#     with them baked in gave 0.8967 -- neither better than holding AABS off --
+#     while the private copy costs 5x the wall clock (a new kernel identity
 #     invalidates the Triton disk cache for every shape, turning a 170 s
 #     benchmark into 968 s).
 #
@@ -412,17 +380,6 @@ def _tab_kernel_replaced():
 # ---------------------------------------------------------------------------
 
 
-@contextlib.contextmanager
-def _aabs_disabled():
-    """Hold FlagTree AABS off for the duration of the launch."""
-    previous = _autotuning_knobs.adjust_block_size
-    _autotuning_knobs.adjust_block_size = False
-    try:
-        yield
-    finally:
-        _autotuning_knobs.adjust_block_size = previous
-
-
 def cudnn_convolution(
     input,
     weight,
@@ -437,28 +394,13 @@ def cudnn_convolution(
     """CUDNN-compatible no-bias convolution for iluvatar.
 
     Signature, dispatch and results are those of the generic implementation
-    (see flag_gems.ops.cudnn_convolution). Two changes are made on the way in:
-    AABS is held off, and the small-C_in direct branch runs this package's
-    tap-packed tl.dot kernel instead of the shipped scalar-FMA one.
+    (see flag_gems.ops.cudnn_convolution). The only change on the way in is that
+    the small-C_in direct branch runs this package's tap-packed tl.dot kernel
+    instead of the shipped scalar-FMA one. AABS is held off by the generic op.
     """
     logger.debug("GEMS_ILUVATAR CUDNN_CONVOLUTION")
 
-    # triton.knobs is unavailable on Triton < 3.6, where AABS does not exist
-    # either, so there is nothing to hold off.
-    if _autotuning_knobs is None:
-        return _generic_cudnn_convolution(
-            input,
-            weight,
-            padding,
-            stride,
-            dilation,
-            groups,
-            benchmark,
-            deterministic,
-            allow_tf32,
-        )
-
-    with _aabs_disabled(), _tab_kernel_replaced():
+    with _tab_kernel_replaced():
         return _generic_cudnn_convolution(
             input,
             weight,
