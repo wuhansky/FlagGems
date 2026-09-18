@@ -26,6 +26,23 @@ pytestmark = pytest.mark.skipif(
     flag_gems.vendor_name == "cambricon", reason="Issue #5254: Not supported"
 )
 
+# The reference below is the device's own convolution, so it has to be fp32-exact
+# for an fp32 comparison to mean anything. Without --ref cpu, to_reference()
+# cannot upcast (the device has no fp64) and the reference runs in fp32 on the
+# NPU -- where the cube rounds both operands to an ~11-bit mantissa. That is the
+# same reduced-precision trade-off the CUDA conv tests already opt out of with
+# torch.backends.cudnn.allow_tf32 = False (see test_conv2d.py); allow_hf32 is
+# its Ascend equivalent.
+#
+# Measured against an fp64 CPU reference on (1,4,16)/(4,1,3): the vendor conv is
+# off by 4.5e-4 with HF32 on and 2.4e-7 with it off, while this operator's kernel
+# is 1.2e-7 either way. So leaving it on fails the fp32 column at atol=1e-4 over
+# a difference that lives entirely in the reference.
+try:
+    torch.npu.conv.allow_hf32 = False
+except AttributeError:
+    pass
+
 # ---------------------------------------------------------------------------
 # Parameter sets
 #
