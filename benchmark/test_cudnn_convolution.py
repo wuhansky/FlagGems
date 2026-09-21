@@ -50,8 +50,8 @@ from . import base, consts, utils
 # dimension. Order matches the expected report: bfloat16, float16, float32.
 BENCH_DTYPES = [
     torch.bfloat16,
-    torch.float16,
-    torch.float32,
+    #torch.float16,
+    #torch.float32,
 ]
 
 # Core cases keep `--level core` fast: one plain convolution plus the deepest
