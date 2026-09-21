@@ -179,6 +179,25 @@ _DOT_MIN = 16
 # BLOCK_W is the cheaper half: measured 0.545 ms against 0.593 ms on
 # (64,48,1024)/k5/s2.
 _UB_TILE_MAX = 8192
+# Tile for _compact_plane_kernel, swept at fixed volume on the (rows, 132) ->
+# (rows, 130) shape: 64x256 161.8 us, 128x256 156.3, 256x256 172.9.  Every other
+# form of the same copy is far worse -- see that kernel.
+_COMPACT_BLOCK_W = 256
+_COMPACT_BLOCK_R = 128
+
+
+def _compact_block_w(ow):
+    """Column tile for _compact_plane_kernel: the padded row, rounded up.
+
+    ``_COMPACT_BLOCK_W`` alone is a fixed 256 columns whatever OW is, and the
+    compaction's load is a masked ``(BLOCK_R, BLOCK_W)`` tile of a row that is
+    only OW wide -- so at OW=32 it fetches eight times the bytes it keeps, and
+    the pass costs more than the convolution it is compacting for: on
+    (16,32,32,32)/k3/d2 the compaction is 31.7 us of an 81 us call against the
+    conv kernel's own 24.9.  Rounding the tile down to OW costs nothing where OW
+    is already past 256, and where it is not the tile becomes the row.
+    """
+    return min(_COMPACT_BLOCK_W, triton.next_power_of_2(max(1, ow)))
 # Unrolled taps a kernel may have and still be handed fp16/bf16 tiles for its
 # dots.  Not a tuning knob: see _arith_dtype.  9 is the same ceiling the 3D note
 # records for unrolled taps that hold a dot at all, and it is the one the 2D
@@ -294,6 +313,41 @@ _SPLIT_MIN_STRIDE = 2
 # The boundary is one cache line (128), which is where the measurements separate
 # -- see _pad_input.
 _PAD_RUN_BYTES = 128
+# Elements each program of the flat-row halo kernel (_pad_flat_row_kernel)
+# covers, used to derive its BLOCK_R from the row width.  It is a count and not
+# a row count because the row width is what varies by 16x across the 1-D suite
+# (512 to 8192): a fixed BLOCK_R would leave the widest rows with four programs
+# and the narrowest with a thousand.
+#
+# Swept on the whole call over the five 1-D cases that reach it through the
+# fused entry -- 4096 against 8192, medians of three, gems device time in us,
+# torch against the same run so the ratio is what is being read:
+#
+#                     4096          8192
+#   [ 1] (32,64,512)  21.9 / 1.810  21.6 / 1.919   rows 2048, W  512
+#   [ 2] (16,32,1024) 25.1 / 1.819  21.5 / 2.181   rows  512, W 1024
+#   [ 7] (16,24,2048) 55.7 / 1.110  49.3 / 1.259   rows  384, W 2048
+#   [10] (16,32,512)  10.1 / 2.396  21.0 / 1.154   rows  512, W  512
+#   [11] (8,4,512)     9.6 / 1.438   9.3 / 1.509   rows   32, W  512
+#
+# 4096 wins by +0.025 on the suite's mean, and it wins on [10] alone: that one
+# case is 10.9 us better at 4096, and at a torque of 2/(22*10) it is worth more
+# than the 0.3/3.6/6.4/0.3 us the other four give back.  That is the same [10]
+# that picked 8192 before this kernel was fused, by the same kind of margin --
+# at 8192 the pair of launches cost pad 3.2 + prep 3.2 us against 14.8 us for
+# the fused one, and at 4096 the fused one is 5.4 us against that same pair.
+# The optimum moved because the kernel did, and there is no shape law under it
+# either way: [1] and [10] have the same W=512 and the same BLOCK_R here, and
+# land on opposite sides of the crossover in *both* kernels.  Read the
+# aggregate, and re-sweep this whenever the flat branch's kernel changes --
+# which is the only reason the numbers above are worth writing down.
+#
+# The other two 1-D cases, [6] and [8], reach this constant through _pad_input
+# rather than the fused entry (_direct_conv gives them the split-width halo, so
+# their pad is the halo's own, un-fused launch).  They go the other way, 93.1
+# against 85.0 and 32.4 against 31.9 at 4096, worth -0.003 between them.  The
+# seven come to +0.022.
+_PAD_FLAT_ELEMS = 4096
 # Spare elements left at the end of every buffer the kernels index directly, so
 # that a masked lane's address stays inside the allocation.  See _slack.
 _SLACK_ELEMS = 8192
@@ -428,6 +482,156 @@ def _pad_copy_interior_2d_kernel(
 
 @libentry()
 @triton.jit
+def _pad_flat_row_kernel(
+    in_ptr,
+    out_ptr,
+    PW,
+    Wp,
+    W: tl.constexpr,
+    BORDER: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    CAST_FP32: tl.constexpr,
+):
+    """Whole halo for an unpadded row axis, in one launch.
+
+    Both halves of the pad are here: the interior is a row of ``W`` read from
+    the source's own (contiguous) row stride and written one ``PW`` further on,
+    and the two borders are masked stores of zero off the same ``BLOCK_R`` rows.
+    ``_pad_input`` splits that into ``_memset_kernel`` over the whole padded
+    buffer and ``_pad_copy_interior_2d_kernel`` over the interior, which is a
+    second launch and a full extra write of the interior to zero a few columns
+    that are not read as often as they are written.
+
+    Every address here is affine and in bounds without a clamp.  The source is
+    read at ``r*W + c`` with ``c < W`` exactly (the caller guarantees ``W`` is a
+    power of two, so ``tl.arange`` can span it exactly -- this is the one place
+    the power-of-two requirement buys something rather than costing it), and
+    the destinations are ``r*Wp + c + PW`` for the interior plus the borders at
+    ``r*Wp + b`` and ``r*Wp + W + PW + b``.  The right border's *masked* lanes
+    reach ``BORDER - PW - tail`` past the end of the last row, which is why the
+    allocation carries the usual slack: the mask suppresses the access, not the
+    address, and the MTE faults on the address first.
+
+    ``CAST_FP32`` reads a bf16/fp16 source and writes fp32 out.  The kernel
+    already touches every element of the input, so an upcast here is a wider
+    store and nothing else -- where ``input.to(arith)`` in front of it is a
+    whole launch of its own (aclnnInplaceCopy_CastAiCore), 1.8 us on [11] and
+    3.4 us on [7] against 9.4 and 53.1 us calls.  Only the interior run is cast;
+    the two border stores write zeros, which are the same value either way.  See
+    the ``cast`` gate in _pad_flat_row for when it is allowed.
+    """
+    r = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
+    c = tl.arange(0, W)
+    v = tl.load(in_ptr + r[:, None] * W + c[None, :])
+    if CAST_FP32:
+        v = v.to(tl.float32)
+    tl.store(out_ptr + r[:, None] * Wp + (c[None, :] + PW), v)
+
+    b = tl.arange(0, BORDER)
+    rb = r[:, None] * Wp
+    tl.store(out_ptr + rb + b[None, :], 0.0, mask=(b < PW)[None, :])
+    tl.store(
+        out_ptr + rb + (W + PW + b[None, :]),
+        0.0,
+        mask=(b < Wp - W - PW)[None, :],
+    )
+
+
+@libentry()
+@triton.jit
+def _pad_flat_prep_kernel(
+    in_ptr,
+    pad_ptr,
+    w_ptr,
+    wt_ptr,
+    PW,
+    Wp,
+    N_PAD: tl.constexpr,
+    GRID1: tl.constexpr,
+    W: tl.constexpr,
+    BORDER: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    S_OC: tl.constexpr,
+    C: tl.constexpr,
+    OC: tl.constexpr,
+    T: tl.constexpr,
+    OUT_FP32: tl.constexpr,
+    BLOCK_OC: tl.constexpr,
+    BLOCK_CT: tl.constexpr,
+    CAST_FP32: tl.constexpr,
+):
+    """``_pad_flat_row_kernel`` and ``_prep_weight_kernel`` in one launch.
+
+    The two bodies are exactly the kernels they replace, joined on the program
+    id: the pad tiles take ``[0, N_PAD)`` and the weight tiles the rest.  The
+    bodies share nothing, so this buys nothing but a launch -- which is the
+    point.  A launch is 2.4 us of device time whatever the grid holds, and on
+    the small 1-D shapes the whole call is three of them: (16,32,512)/k3 runs
+    in 11.2 us and 1.5 us of that is the prep.  Nothing smaller can be fused
+    out of these calls -- the pad has to finish before the conv reads it, and
+    the conv is the third launch.
+
+    The join is on ``tl.program_id``, and that has to be a real branch for the
+    else-arm's ``pid - N_PAD`` to stay non-negative; if the backend ran both
+    arms of every program it would index negatively and the MTE would fault on
+    the address before any mask was consulted.  Checked directly on this
+    backend rather than assumed -- a probe kernel with two disjoint stores and a
+    grid that straddles N does fill both and only both.  ``N_PAD`` is constexpr
+    so the test is against an immediate.
+
+    ``GRID1`` is the prep kernel's second axis, folded in here because a
+    single flat grid has one axis: the pad tiles are laid out first, so
+    ``q = pid - N_PAD`` is the prep kernel's own ``p0 * GRID1 + p1`` and the two
+    are recovered by a division by a constant.  Everything else about that body
+    is unchanged, including why it is worth having (see _prep_weight).
+    """
+    pid = tl.program_id(0)
+    if pid < N_PAD:
+        r = pid * BLOCK_R + tl.arange(0, BLOCK_R)
+        c = tl.arange(0, W)
+        v = tl.load(in_ptr + r[:, None] * W + c[None, :])
+        if CAST_FP32:
+            v = v.to(tl.float32)
+        tl.store(pad_ptr + r[:, None] * Wp + (c[None, :] + PW), v)
+
+        b = tl.arange(0, BORDER)
+        rb = r[:, None] * Wp
+        tl.store(pad_ptr + rb + b[None, :], 0.0, mask=(b < PW)[None, :])
+        tl.store(
+            pad_ptr + rb + (W + PW + b[None, :]),
+            0.0,
+            mask=(b < Wp - W - PW)[None, :],
+        )
+    else:
+        q = pid - N_PAD
+        p0 = q // GRID1
+        p1 = q - p0 * GRID1
+        ct = p0 * BLOCK_CT + tl.arange(0, BLOCK_CT)
+        oc = p1 * BLOCK_OC + tl.arange(0, BLOCK_OC)
+        ct_ok = ct < C * T
+        oc_ok = oc < OC
+        cn = ct // T
+        tn = ct - cn * T
+        # Named apart from the pad arm's ``v``, which it would otherwise join at
+        # the merge point of the two branches: a name assigned on both sides has
+        # to have one type, and these are (BLOCK_CT, BLOCK_OC) against
+        # (BLOCK_R, W) whatever the element size.  Renamed, the two never meet.
+        wv = tl.load(
+            w_ptr + oc[:, None] * S_OC + ct[None, :],
+            mask=oc_ok[:, None] & ct_ok[None, :],
+            other=0.0,
+        )
+        if OUT_FP32:
+            wv = wv.to(tl.float32)
+        tl.store(
+            wt_ptr + tn[:, None] * (C * OC) + cn[:, None] * OC + oc[None, :],
+            tl.trans(wv),
+            mask=ct_ok[:, None] & oc_ok[None, :],
+        )
+
+
+@libentry()
+@triton.jit
 def _pad_copy_interior_3d_kernel(
     in_ptr,
     out_ptr,
@@ -513,6 +717,144 @@ def _pad_zero_vstrip_kernel(
     )
 
 
+def _pad_flat_row(input, padding, tail, weight=None, out_dtype=None):
+    """The 1-D halo, optionally carrying the weight permutation in its launch.
+
+    Returns ``(src, wt)``; ``(None, None)`` when the shape does not reach here,
+    and ``(src, None)`` when it does but no weight was handed over.
+
+    The 1-D lift, before either branch of ``_pad_input``, because both are the
+    wrong shape for it.  ``_direct_conv`` lifts a 1-D call to 2-D with a leading
+    unit *height*, so here H == 1 and PH == 0 -- which makes the padded planes
+    contiguous in the flat row axis too (Hp == H, so out_plane == out_row ==
+    Wp).  The (n, c, h) triple therefore collapses into a single row axis of
+    N*C rows, and the interior copy becomes a plain 2-D strided copy with
+    BLOCK_R rows per program.
+
+    Left alone, a 1-D call takes the wide branch and aclnn's ViewCopy.  That
+    copy is issued as N*C separate strided rows of 1 KB source against a
+    destination stride of Wp*element_size -- 1028 B on (32,64,512)/k3, not a
+    multiple of the cache line, so no two rows share an alignment.  It runs at
+    153 GB/s: 26.8 us to move 4 MB, against a whole call of 50 us, and it is
+    the largest single kernel on every 1-D shape in the suite (26.8 / 20.5 /
+    15.8 / 14.1 / 7.6 / 7.3 us on [1] [2] [6] [7] [8] [11]).
+
+    The row axis must divide BLOCK_R, which is what keeps every address in
+    bounds: with rows % BLOCK_R == 0 no program overshoots on that axis, so the
+    load needs neither a mask nor the allocator's slack (the two border stores
+    do still carry the usual one; see the kernel).  W must be a power of two so
+    ``tl.arange`` can span a whole row, which is the one place that requirement
+    buys something rather than costing it.
+
+    ``weight`` is the second entry point into the same launch: when it is given,
+    the permutation ``_prep_weight`` would build in its own kernel is built here
+    instead, and the launch with it is not spent.  Every 1-D case with a kernel
+    larger than 1x1 arrives with one, which is all of them but [9]; the 1x1
+    shapes have no permutation to fold in at all (see the gate in
+    _direct_conv2d) and the caller passes None for them.  See
+    _pad_flat_prep_kernel for the join.
+
+    ``out_dtype`` is the arithmetic dtype, and it is also the dtype the halo is
+    written in: when it differs from the input's the kernel does the upcast
+    itself (see ``CAST_FP32``) and the launch ``input.to(arith)`` would have
+    been is not spent.  It is the same argument that decides ``OUT_FP32`` for
+    the weight, so the caller hands over ``arith`` either way and the cast
+    happens wherever the copy happens.  The gate is ``is_contiguous``: the
+    kernel addresses the source as ``r*W + c``, and today the only reason a
+    strided input cannot reach it is that ``.to(arith)`` allocated a
+    contiguous one on the way.  Skipping the cast means keeping the caller's
+    tensor, so a strided one has to be turned away and _direct_conv2d sends it
+    down the old path -- see the ``cast_in`` gate there for where that is
+    decided.
+    """
+    # Before the shape test, and for the same reason _pad_input has it before
+    # its branches: with no padding and no tail there is no halo to build, and
+    # the input is already a valid source.  The launcher calls this directly
+    # rather than through _pad_input, so it has to make that call itself --
+    # leaving it to the fallback would find the flat branch unreachable anyway
+    # (it would return the input unchanged) but only after a full copy of it,
+    # which is what a 1x1 call with p=0 paid here: 1.5 us, one launch, for a
+    # tensor the convolution reads as it stands.
+    #
+    # With a cast to do, that early-out is not free any more -- there is no
+    # halo, but there is still the upcast, and it has to happen somewhere.  It
+    # happens here, in the launch this function was supposed to be avoiding,
+    # which is exactly what the caller would have paid without the fold.
+    tail = max(0, tail)
+    cast = out_dtype is not None and out_dtype != input.dtype
+    if not any(padding) and tail == 0:
+        return (input.to(out_dtype) if cast else input), None
+    if not (input.ndim - 2 == 2 and input.shape[2] == 1 and padding[0] == 0):
+        return None, None
+    N, C, W = input.shape[0], input.shape[1], input.shape[3]
+    PW = padding[1]
+    rows = N * C
+    Wp = W + 2 * PW + tail
+    if W < 2 or W & (W - 1):
+        return None, None
+    block_r = max(1, _PAD_FLAT_ELEMS // W)
+    while block_r > 1 and rows % block_r:
+        block_r -= 1
+    if rows % block_r or block_r * W > _UB_TILE_MAX:
+        return None, None
+    border = max(1, triton.next_power_of_2(PW + tail))
+    buf = torch.empty(
+        rows * Wp + max(_SLACK_ELEMS, border),
+        device=input.device,
+        dtype=out_dtype if cast else input.dtype,
+    )
+    out = buf[: rows * Wp].view(N, C, 1, Wp)
+    if weight is None:
+        _pad_flat_row_kernel[(rows // block_r,)](
+            input,
+            out,
+            PW,
+            Wp,
+            W=W,
+            BORDER=border,
+            BLOCK_R=block_r,
+            CAST_FP32=cast,
+            num_warps=_NUM_WARPS,
+        )
+        return out, None
+    oc, c = weight.shape[0], weight.shape[1]
+    t = 1
+    for size in weight.shape[2:]:
+        t *= size
+    out_dtype = weight.dtype if out_dtype is None else out_dtype
+    numel = oc * c * t
+    wbuf = torch.empty(
+        numel + _SLACK_ELEMS, device=weight.device, dtype=out_dtype
+    )
+    wt = wbuf[:numel].view(*weight.shape[2:], c, oc)
+    block_ct, block_oc = _prep_blocks(c * t, oc)
+    grid1 = triton.cdiv(oc, block_oc)
+    n_pad = rows // block_r
+    _pad_flat_prep_kernel[(n_pad + triton.cdiv(c * t, block_ct) * grid1,)](
+        input,
+        out,
+        weight.contiguous(),
+        wt,
+        PW,
+        Wp,
+        N_PAD=n_pad,
+        GRID1=grid1,
+        W=W,
+        BORDER=border,
+        BLOCK_R=block_r,
+        S_OC=c * t,
+        C=c,
+        OC=oc,
+        T=t,
+        OUT_FP32=out_dtype == torch.float32,
+        BLOCK_OC=block_oc,
+        BLOCK_CT=block_ct,
+        CAST_FP32=cast,
+        num_warps=_NUM_WARPS,
+    )
+    return out, wt
+
+
 def _pad_input(input, padding, tail):
     """Materialise the zero halo the kernels index through.
 
@@ -585,6 +927,11 @@ def _pad_input(input, padding, tail):
     tail = max(0, tail)
     if not any(padding) and tail == 0:
         return input
+    # The 1-D lift, before either branch below, because both are the wrong shape
+    # for it.  Shapes it does not take fall through unchanged.
+    flat = _pad_flat_row(input, padding, tail)
+    if flat[0] is not None:
+        return flat[0]
     # Wide innermost run: the halo is a ``torch.zeros`` + strided ``copy_``.  The
     # copy writes the interior through a view whose innermost axis is a full
     # contiguous line (>= one cache line), so it moves every byte once at ~420
@@ -1238,6 +1585,7 @@ def _direct_conv2d_kernel(
     USE_DOT: tl.constexpr,
     W_SPLIT: tl.constexpr,
     RUNTIME_TAPS: tl.constexpr,
+    W_OC_STRIDE: tl.constexpr,
 ):
     pid_row = tl.program_id(0)
     pid_oc = tl.program_id(1)
@@ -1316,7 +1664,7 @@ def _direct_conv2d_kernel(
             else:
                 iw = ow * SW + kw * DW
                 tap_in = in_group + in_row + ih * in_h_stride + iw * in_w_stride
-            tap_w = weight_ptr + t * C_IN * w_c_stride + oc_glob
+            tap_w = weight_ptr + t * C_IN * w_c_stride + oc_glob * W_OC_STRIDE
             cc = tl.arange(0, BLOCK_C)
             for cb in range(0, C_IN, BLOCK_C):
                 if NEED_CMASK:
@@ -1362,7 +1710,11 @@ def _direct_conv2d_kernel(
                     tap_in = in_group + in_row + ih * in_h_stride + iw * in_w_stride
                 # Weight is (KH, KW, C, OC), so the tap selects a plane and the
                 # output channel is the unit-stride axis.
-                tap_w = weight_ptr + (kh * KW + kw) * C_IN * w_c_stride + oc_glob
+                tap_w = (
+                    weight_ptr
+                    + (kh * KW + kw) * C_IN * w_c_stride
+                    + oc_glob * W_OC_STRIDE
+                )
                 if USE_DOT:
                     # One (BLOCK_OC, BLOCK_C) x (BLOCK_C, BLOCK_W) dot per tap and
                     # channel block, which is what puts this on the cube. Reducing
@@ -1406,6 +1758,160 @@ def _direct_conv2d_kernel(
         acc,
         mask=oc_mask[:, None] & w_ok[None, :],
     )
+
+
+@libentry()
+@triton.jit
+def _flat_conv2d_kernel(
+    input_ptr,
+    weight_ptr,
+    output_ptr,
+    in_n_stride,
+    in_c_stride,
+    out_n_stride,
+    out_plane,
+    tot_p,
+    wp,
+    C_IN,
+    OC,
+    KH: tl.constexpr,
+    KW: tl.constexpr,
+    DH: tl.constexpr,
+    DW: tl.constexpr,
+    GROUPS: tl.constexpr,
+    BLOCK_OC: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    NEED_OCMASK: tl.constexpr,
+    NEED_CMASK: tl.constexpr,
+):
+    """Stride-1 conv2d over a *flat* (oh, ow) index, so x runs long and contiguous.
+
+    Probe of what this fixes.  The tap address of output position (oh, ow) is
+
+        (oh + kh) * Wp + (ow + kw)   =   p + kh * Wp + kw,   p = oh * Wp + ow
+
+    a *constant* shift -- provided the padded input's row stride and the output
+    plane's row stride are both Wp.  So a program can own a flat interval of p
+    spanning many rows, and the x load becomes (BLOCK_C, BLOCK_M) with BLOCK_M*2
+    contiguous bytes per row instead of BLOCK_W*2.
+
+    That run length is the whole point.  Measured on this device, isolating one
+    load pattern, GB/s against a 1753 GB/s fully-flat copy:
+
+        run     256 B   512 B   1024 B   2048 B
+        GB/s      382     623      859     1367
+
+    It is not the number of taps: reading the same tile nine times at offsets of
+    one element costs 0.98x of reading it once, so the taps hit cache.  It is
+    not the number of channels either.  It is the length of the innermost
+    contiguous run, and at W=128/k3/p2 the blocked kernel's run is 2*OW bytes.
+    Flat takes it to BLOCK_M.
+
+    On (32,64,128,128)/oc32/k3/p2 the conv goes 1709 us -> 533 us, 11.7 -> 37.4
+    TFLOP/s.  The ceiling is now the cube, not the MTE: 19.9 GFLOP over 533 us.
+
+    The price is the output layout.  p is flat over a plane that is Wp wide, so
+    the result has to be written Wp-strided and compacted back to OW columns
+    afterwards -- see _compact_plane_kernel.  Nothing else changes: no mask on
+    the tap load (the halo supplies the zeros, exactly as in the blocked
+    kernel), and the address stays affine in p, which is what the backend's axis
+    analysis needs.
+
+    Wp must be the *unwidened* padded width, W + 2*PW.  The blocked kernel
+    widens every padded row so the last tile's masked lanes land inside it; here
+    the only overshoot is the last program's, so the room is a single tail on
+    the whole allocation instead of 126 columns on every row.  That also halves
+    the halo: Wp goes 258 -> 132 on (32,64,128,128), so the strided interior
+    copy that builds it runs at 97% row density instead of 50%.
+    """
+    pid_p = tl.program_id(0)
+    pid_oc = tl.program_id(1)
+    pid_ng = tl.program_id(2)
+    if GROUPS == 1:
+        n = pid_ng
+        pid_group = 0
+    else:
+        n = pid_ng // GROUPS
+        pid_group = pid_ng % GROUPS
+
+    oc_per_group = OC // GROUPS
+    oc_off = pid_oc * BLOCK_OC + tl.arange(0, BLOCK_OC)
+    oc_glob = pid_group * oc_per_group + oc_off
+    oc_mask = oc_off < oc_per_group
+
+    p = pid_p * BLOCK_M + tl.arange(0, BLOCK_M)
+    cc = tl.arange(0, BLOCK_C)
+
+    base = input_ptr + n * in_n_stride + pid_group * C_IN * in_c_stride
+    acc = tl.zeros((BLOCK_OC, BLOCK_M), dtype=tl.float32)
+    for kh in tl.static_range(KH):
+        for kw in tl.static_range(KW):
+            off = p + (kh * DH) * wp + kw * DW
+            tap_w = weight_ptr + (kh * KW + kw) * C_IN * OC + oc_glob
+            for cb in range(0, C_IN, BLOCK_C):
+                x = tl.load(base + (cb + cc)[:, None] * in_c_stride + off[None, :])
+                # The channel mask sits on the *weight*, not on x, and only its
+                # last block can fail it: a lane of x that overshoots C_IN reads
+                # the next channel, which is garbage but in-bounds given the
+                # tail, and the zeroed weight discards it.  Masking x instead
+                # would put a compare on the load that matters (BLOCK_C x
+                # BLOCK_M) to save a compare on the one that does not.
+                w_off = tap_w[:, None] + (cb + cc)[None, :] * OC
+                if NEED_CMASK or NEED_OCMASK:
+                    w = tl.load(
+                        w_off,
+                        mask=oc_mask[:, None] & ((cb + cc)[None, :] < C_IN),
+                        other=0.0,
+                    )
+                else:
+                    w = tl.load(w_off)
+                acc = tl.dot(w, x, acc)
+
+    # ``oc_mask`` is in the store mask for the reason the channel overshoot is:
+    # a lane past OC keeps its address, and the output plane's channel stride
+    # walks it straight into the next image.  Nothing upsets this in 2-D because
+    # _pick_flat_blocks derives BLOCK_OC from the channel count and the two only
+    # disagree above _BLOCK_OC_MAX -- but the 3-D launcher raises BLOCK_OC to
+    # _DOT_MIN on shapes _DOT_MIN/2 wide, and there the surplus lanes measured a
+    # 0.68-0.93 relative error scattered over the *following* image.
+    tl.store(
+        output_ptr + n * out_n_stride + oc_glob[:, None] * out_plane + p[None, :],
+        acc,
+        mask=(p < tot_p)[None, :] & oc_mask[:, None],
+    )
+
+
+@libentry()
+@triton.jit
+def _compact_plane_kernel(
+    src_ptr,
+    dst_ptr,
+    OW,
+    ROWS,
+    WP: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+):
+    """(rows, Wp) -> (rows, OW), dropping the Wp - OW slack columns of each row.
+
+    Small and unavoidable, and it costs far more than the bytes it moves: 156 us
+    for 69 MB on (32,64,128,128), 443 GB/s against 1753 GB/s for a flat copy.
+
+    That is the row stride, not the mask.  Swept at fixed volume, every form
+    lands in the same band -- OW=132 unmasked and contiguous 52 us, OW=130
+    masked 51-64 us, OW=128 exactly-masked 54-64 us, OW=126 masked 51-55 us --
+    so a store that needs no mask at all is no faster than one that does.  What
+    does cost is giving each row its own address: one row per program with a 1-D
+    contiguous load and a 1-D contiguous store is 716 us, five times *worse*,
+    and the same shape with a per-lane // and % to rebuild the column index is
+    55.9 ms.  A strided 2-D tile is the best form available; this is it.
+    """
+    r = tl.program_id(1) * BLOCK_R + tl.arange(0, BLOCK_R)
+    c = tl.program_id(0) * BLOCK_W + tl.arange(0, BLOCK_W)
+    m = (c < OW)[None, :] & (r < ROWS)[:, None]
+    v = tl.load(src_ptr + r[:, None] * WP + c[None, :], mask=m, other=0.0)
+    tl.store(dst_ptr + r[:, None] * OW + c[None, :], v, mask=m)
 
 
 @libentry()
@@ -1566,6 +2072,536 @@ def _direct_conv3d_kernel(
     )
 
 
+@libentry()
+@triton.jit
+def _flat_conv3d_kernel(
+    input_ptr,
+    weight_ptr,
+    output_ptr,
+    in_n_stride,
+    in_c_stride,
+    in_d_stride,
+    out_n_stride,
+    out_c_stride,
+    out_d_stride,
+    tot_p,
+    RS,
+    C_IN,
+    OC,
+    KD: tl.constexpr,
+    KH: tl.constexpr,
+    KW: tl.constexpr,
+    DD: tl.constexpr,
+    DH: tl.constexpr,
+    DW: tl.constexpr,
+    GROUPS: tl.constexpr,
+    OD: tl.constexpr,
+    BLOCK_OC: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    NEED_OCMASK: tl.constexpr,
+    NEED_CMASK: tl.constexpr,
+):
+    """Stride-1 conv3d over a *flat* (oh, ow) index, one depth slice per program.
+
+    The 2-D kernel's identity, applied one dimension at a time.  A tap of output
+    position (od, oh, ow) reads the padded input at
+
+        (od + kd*DD)*Dp*Hp*Wp + (oh + kh*DH)*Wp + (ow + kw*DW)
+      = od*Dp*Hp*Wp + [(oh*Wp + ow) + kd*DD*Dp*Hp*Wp + kh*DH*Wp + kw*DW]
+
+    so with the output's flat index taken over one depth slice,
+    ``p = oh*Wp + ow``, every tap is again a constant shift of ``p``.  The depth
+    axis rides on the grid as ``od`` and costs nothing -- input and output spell
+    it with different strides, which is fine only because it is outside ``p``.
+
+    That is the whole fix for 3-D, and it is the same one 2-D needed.  The
+    blocked 3-D kernel's innermost run is BLOCK_W fp32 elements -- 16 of them,
+    64 bytes, at W=16 -- and the MTE pays for the cache lines a run touches
+    rather than the bytes it keeps.  Measured through this entry point on the
+    (2,16,16,16,16)/k3 shape, 512 depth slices, only the run varying:
+
+        run       64 B   128 B   256 B   512 B   1024 B   2048 B
+        us        958     605     564     327      286      199
+        GB/s      310     515     603    1038     1587     2281
+
+    7.4x end to end, and the taps stop costing: at 2048 B runs nine taps move
+    2022 GB/s against 342 for one, i.e. they hit cache once the working set
+    fits.  Flat's BLOCK_M is 256-1024 elements here (the (oh, ow) plane of these
+    shapes is 168-624 wide), so every 3-D case lands in the top two rows.
+
+    Wp is the un-widened padded width, as in 2-D, and the price is the same:
+    the result is written Wp-strided per depth slice and compacted back to OW
+    columns by _compact_plane_kernel, which sees it as a plain
+    (N*OC*OD*OH, Wp) plane because the slices are contiguous inside a channel.
+    """
+    pid_p = tl.program_id(0)
+    pid_oc = tl.program_id(1)
+    pid_a = tl.program_id(2)
+
+    n = pid_a // (GROUPS * OD)
+    rem = pid_a % (GROUPS * OD)
+    pid_group = rem // OD
+    od = rem % OD
+
+    oc_per_group = OC // GROUPS
+    oc_off = pid_oc * BLOCK_OC + tl.arange(0, BLOCK_OC)
+    oc_glob = pid_group * oc_per_group + oc_off
+    oc_mask = oc_off < oc_per_group
+
+    p = pid_p * BLOCK_M + tl.arange(0, BLOCK_M)
+    cc = tl.arange(0, BLOCK_C)
+
+    base = (
+        input_ptr
+        + n * in_n_stride
+        + pid_group * C_IN * in_c_stride
+        + od * in_d_stride
+    )
+    acc = tl.zeros((BLOCK_OC, BLOCK_M), dtype=tl.float32)
+    for kd in tl.static_range(KD):
+        for kh in tl.static_range(KH):
+            h_off = kd * DD * in_d_stride + kh * DH * RS
+            for kw in tl.static_range(KW):
+                off = p + (h_off + kw * DW)
+                tap_w = (
+                    weight_ptr
+                    + ((kd * KH + kh) * KW + kw) * C_IN * OC
+                    + oc_glob
+                )
+                for cb in range(0, C_IN, BLOCK_C):
+                    x = tl.load(
+                        base + (cb + cc)[:, None] * in_c_stride + off[None, :]
+                    )
+                    # The channel mask sits on the weight, not on x, for the
+                    # reason given in the 2-D kernel: the overshooting x lanes
+                    # read the next channel, which the zeroed weight discards,
+                    # and a masked load would cost a compare on the tile that
+                    # matters to save one on the tile that does not.
+                    w_off = tap_w[:, None] + (cb + cc)[None, :] * OC
+                    if NEED_CMASK or NEED_OCMASK:
+                        w = tl.load(
+                            w_off,
+                            mask=oc_mask[:, None] & ((cb + cc)[None, :] < C_IN),
+                            other=0.0,
+                        )
+                    else:
+                        w = tl.load(w_off)
+                    acc = tl.dot(w, x, acc)
+
+    # ``oc_mask`` in the store mask covers the BLOCK_OC this launcher raises to
+    # _DOT_MIN, which the shape rarely fills; see the 2-D kernel.
+    tl.store(
+        output_ptr
+        + n * out_n_stride
+        + od * out_d_stride
+        + oc_glob[:, None] * out_c_stride
+        + p[None, :],
+        acc,
+        mask=(p < tot_p)[None, :] & oc_mask[:, None],
+    )
+
+
+
+# ``_pad_copy_interior_3d_kernel`` opens its width axis with a single
+# ``tl.arange`` and no loop over it, so a padded row wider than this cannot use
+# it and falls back to the strided copy.
+_PAD_FLAT_W_MAX = 128
+
+
+def _pad_input_flat(input, padding, tail):
+    """``_pad_input``'s halo with the spare room as one tail on the allocation.
+
+    ``_pad_input`` widens *every* padded row by ``tail`` so the last output
+    tile's masked lanes land inside the tensor.  The flat kernel has no per-tile
+    masked lanes -- its programs cover the plane contiguously and only the very
+    last one overshoots -- so the rows can stay exactly ``W + 2*PW`` wide and
+    the room can be a single tail past the end.
+
+    That is worth more than the tail it saves.  On (32,64,128,128)/p2 the
+    blocked path's block_w of 256 forces tail=126, so the interior copy is a
+    256 B row written into a 516 B stride: ~420 GB/s.  At Wp=132 the same copy
+    is a 256 B row into a 264 B stride, 97% dense, and the memset that precedes
+    it is half the bytes.  Measured, that pair is 394 us against 198.
+
+    The rows have to be un-widened for the flat identity to hold at all: the
+    pad's row stride *is* the output plane's row stride, and the kernel's tap
+    offset ``(oh+kh)*Wp + ow+kw`` only collapses to ``p + kh*Wp + kw`` when both
+    use the same Wp.
+
+    The 5-D interior is filled by the same affine triton pair ``_pad_input``
+    uses, not by the strided ``copy_``: aclnn's gather for a 5-D destination
+    lands on its **AiCpu** ViewCopy, which is a host-side element loop and costs
+    200 us on a 0.5 MB interior -- against 18.7 us for the kernel pair, and
+    against a whole (2,16,16,16,16) call of 50 us.  On the four flat 3-D shapes
+    it was 70-92% of the call (199.8 / 669.7 / 146.8 / 136.6 us).  The 4-D
+    destination stays on ``copy_``: there aclnn picks its AiCore ViewCopy, which
+    at 549 GB/s beats the triton copy's 512 B rows (623 GB/s) once the
+    ``torch.zeros`` memset it shares the pass with is counted.
+    """
+    tail = max(0, tail)
+    if tail <= 0 and not any(padding):
+        return input
+    N, C = input.shape[0], input.shape[1]
+    spatial = input.shape[2:]
+    padded = [s + 2 * p for s, p in zip(spatial, padding)]
+    numel = N * C
+    for size in padded:
+        numel *= size
+    if len(spatial) == 3 and spatial[-1] <= _PAD_FLAT_W_MAX:
+        D, H, W = spatial
+        PD, PH, PW = padding
+        Dp, Hp, Wp = padded
+        out = torch.empty(numel + tail, device=input.device, dtype=input.dtype)
+        _memset_kernel[(triton.cdiv(out.numel(), 1024),)](
+            out, out.numel(), BLOCK=1024, num_warps=_NUM_WARPS
+        )
+        BLOCK_H = min(32, triton.next_power_of_2(H))
+        BLOCK_W = triton.next_power_of_2(W)
+        _pad_copy_interior_3d_kernel[(N * C, D, triton.cdiv(H, BLOCK_H))](
+            input, out, D, H, W, PD, PH, PW,
+            D * H * W, H * W, W, Dp * Hp * Wp, Hp * Wp, Wp,
+            BLOCK_H=BLOCK_H, BLOCK_W=BLOCK_W, num_warps=_NUM_WARPS,
+        )
+        return out[:numel].view(N, C, *padded)
+    out = torch.zeros(numel + tail, device=input.device, dtype=input.dtype)
+    interior = out[:numel].view(N, C, *padded)
+    if any(padding):
+        window = (slice(None), slice(None)) + tuple(
+            slice(p, p + s) for p, s in zip(padding, spatial)
+        )
+        interior[window].copy_(input)
+    else:
+        # No halo to write, only room to leave: one contiguous pass.
+        out[:numel].copy_(input.reshape(-1))
+    return interior
+
+
+_FLAT_BLOCK_M = 1024
+# The flat kernel's accumulator is (BLOCK_OC, BLOCK_M) in fp32 and it is what
+# the unified buffer is spent on: swept on (8,256,64,64)/oc256, every tile with
+# BLOCK_OC*BLOCK_M == 32768 compiles and every one above it fails, whatever
+# BLOCK_C is -- (BLOCK_M=1024, BLOCK_C=16, BLOCK_OC=64) fails on the product
+# alone while (256, 64, 128) and (1024, 64, 32) both run.  _BLOCK_ELEMS is the
+# same 32768 the blocked launcher already tiles by, reached from the other side.
+_FLAT_ACC_MAX = 32768
+
+
+def _pick_flat_blocks(oc_per_group, tot_p, floor_oc=1):
+    """Tile for the flat kernels: output channels first, run length second.
+
+    BLOCK_OC sets how many output channels share one x tile, so it divides the
+    x traffic; BLOCK_M only sets the length of the run each of those loads is.
+    Every measurement below has both arms at the accumulator bound, so the split
+    between them is the whole question, and channels win:
+
+        (8,256,64,64)/oc256    BLOCK_OC  128  256  64  32   ->  474  403  570  845 us
+        (32,64,128,128)/oc32   BLOCK_M  1024 512 256      ->  533  778  840 us
+
+    The first shape can trade BLOCK_M away for channels and comes out 2.1x
+    ahead; the second has only 32 channels to give, so BLOCK_M is all it has and
+    takes the lot.  Both fall out of the same rule: spend on channels, then give
+    the remainder to BLOCK_M.
+
+    ``floor_oc`` raises the channel tile past what the shape needs, which only
+    the 3-D launcher asks for: an output channel count under _DOT_MIN would
+    otherwise pin BLOCK_OC below ``tl.dot``'s minimum and cost the kernel its
+    dot arm.  The surplus lanes are masked to zero on the weight, so it is
+    BLOCK_OC/OC times the cube arithmetic against the vector unit's 27 rank-one
+    updates per tap.
+    """
+    block_oc = min(
+        _BLOCK_OC_MAX, max(floor_oc, triton.next_power_of_2(max(1, oc_per_group)))
+    )
+    block_m = min(_FLAT_BLOCK_M, max(_DOT_MIN, _FLAT_ACC_MAX // block_oc))
+    return block_oc, max(_DOT_MIN, min(block_m, triton.next_power_of_2(tot_p)))
+
+
+# How much longer the flat kernel's innermost run has to be before the
+# compaction below is worth paying for.  A gain of 1 is the trap: on
+# (32,64,512) the blocked run is already OW=512 elements, flat's BLOCK_M there is
+# 512 too (BLOCK_OC=64 takes the rest of the accumulator), so it buys nothing and
+# still has to compact 1.07 GB of output -- 2.15 GB of traffic at ~450 GB/s.
+_FLAT_RUN_GAIN = 1.5
+# Ceiling on the compaction's traffic, as a multiple of the x traffic the conv
+# reads to produce the output being compacted.  It is a read *and* a write of a
+# (N,OC,OH,OW) plane against KH*KW passes of a (N,C,Hp,Wp) one, so the ratio is
+# 2*OC*OH*OW / (KH*KW*C*Hp*Wp); on every shape that wins it lands at 0.11-0.21,
+# and 0.5 leaves headroom without being reachable by the ones that lose.
+#
+# Do not widen it on the strength of a single case.  It was widened to 8.0 once,
+# to admit (8,3,224,224)/k3 -- whose ratio is 4.66, because the compaction's
+# stride Wp=226 against OW=224 makes it nearly dense while the conv's x read is
+# a C=3 strided gather at 114 GB/s -- and that case did improve 1.65x (431.6 ->
+# 262.2 us), but the crude byte ratio was the wrong test in more than that one
+# direction: (16,32,1024) k3 also sits between the two values, and flat is much
+# worse on it (46.3 -> 64.1 us; 1-D is a shape the flat identity costs a
+# _compact_plane_kernel *and* a densify for, against a blocked path whose run is
+# already the whole row).  Net on the suite's arithmetic mean the widening was
+# -0.008: one case gained 0.066 and one lost 0.24.
+_FLAT_COMPACT_MAX = 0.5
+
+
+def _use_flat_2d(input, weight, padding, groups, oh, ow, use_dot):
+    """Is the flat kernel both legal and worth its compaction on this shape?
+
+    Legality first.  Stride 1, because the constant tap offset is the flat image
+    of ``oh*SH + kh*DH == (oh+kh)*DH`` and only SH=1 gives it.  The dot, because
+    that is the only arm the kernel has.  And the native dtype, because that is
+    the regime every tile bound here was measured in: _arith_dtype keeps bf16
+    only for fp16/bf16 input under _DOT_TAPS_MAX taps, and in fp32 the x tile
+    doubles against an accumulator budget that was already the binding one.
+
+    Then whether it is worth it, which is two comparisons and both matter.  The
+    run has to actually get longer -- see _pick_flat_blocks for what each form's
+    run is -- and the compaction that buys has to stay small against the x
+    traffic it saves.  Checking only the run is how (32,64,512) slipped through:
+    its run gain is 1, so flat is pure loss there, and the loss is 1.07 GB of
+    output.
+    """
+    if not use_dot or input.dtype not in (torch.float16, torch.bfloat16):
+        return False
+    N, C, H, W = input.shape
+    OC, weight_c, KH, KW = weight.shape
+    if KH * KW > _DOT_TAPS_MAX or OC // groups < _DOT_MIN:
+        return False
+    PH, PW = padding
+    wp = W + 2 * PW
+    tot_p = oh * wp
+    _, block_m = _pick_flat_blocks(OC // groups, tot_p)
+    itemsize = input.element_size()
+    if block_m < _FLAT_RUN_GAIN * min(ow, _BLOCK_W_MAX):
+        return False
+    if wp != ow:
+        moved = 2 * (N * OC * oh * ow)
+        read = KH * KW * (N * C * (H + 2 * PH) * wp)
+        if moved > _FLAT_COMPACT_MAX * read:
+            return False
+    return True
+
+
+def _flat_conv2d(input, weight, padding, dilation, groups, arith):
+    N, C, H, W = input.shape
+    OC, weight_c, KH, KW = weight.shape
+    PH, PW = padding
+    DH, DW = dilation
+    OH = H + 2 * PH - DH * (KH - 1)
+    OW = W + 2 * PW - DW * (KW - 1)
+    Hp, Wp = H + 2 * PH, W + 2 * PW
+    c_stride = Hp * Wp
+    tot_p = OH * Wp
+
+    block_oc, block_m = _pick_flat_blocks(OC // groups, tot_p)
+    block_c = min(_BLOCK_C_MAX, triton.next_power_of_2(weight_c))
+    n_p = triton.cdiv(tot_p, block_m)
+    # The channel tile is the only thing that can overshoot C_IN, and only its
+    # last block: the weight is masked to zero there, so the garbage x lanes it
+    # multiplies are harmless -- but their addresses still have to exist.
+    c_eff = triton.cdiv(weight_c, block_c) * block_c
+
+    tail = (
+        (c_eff - weight_c) * c_stride
+        + n_p * block_m
+        + (KH - 1) * DH * Wp
+        + (KW - 1) * DW
+        + 1
+    )
+    src = _pad_input_flat(input.to(arith), padding, tail)
+
+    out_plane = OH * Wp
+    out_numel = N * OC * out_plane
+    out_buf = torch.empty(
+        out_numel + max(_SLACK_ELEMS, n_p * block_m),
+        device=input.device,
+        dtype=input.dtype,
+    )
+    wt = _prep_weight(weight, arith)
+    grid = (n_p, triton.cdiv(OC // groups, block_oc), N * groups)
+    _flat_conv2d_kernel[grid](
+        src,
+        wt,
+        out_buf,
+        groups * weight_c * c_stride,
+        c_stride,
+        OC * out_plane,
+        out_plane,
+        tot_p,
+        Wp,
+        weight_c,
+        OC,
+        KH=KH,
+        KW=KW,
+        DH=DH,
+        DW=DW,
+        GROUPS=groups,
+        BLOCK_OC=block_oc,
+        BLOCK_C=block_c,
+        BLOCK_M=block_m,
+        NEED_OCMASK=(OC // groups) % block_oc != 0,
+        NEED_CMASK=weight_c % block_c != 0,
+        num_warps=_NUM_WARPS,
+    )
+    if Wp == OW:
+        # k1, or d==0: the flat plane *is* the output plane, no compaction.
+        return out_buf[:out_numel].view(N, OC, OH, OW)
+
+    rows = N * OC * OH
+    out = torch.empty(N * OC * OH * OW, device=input.device, dtype=input.dtype)
+    bw = _compact_block_w(OW)
+    cgrid = (triton.cdiv(OW, bw), triton.cdiv(rows, _COMPACT_BLOCK_R))
+    _compact_plane_kernel[cgrid](
+        out_buf,
+        out,
+        OW,
+        rows,
+        WP=Wp,
+        BLOCK_W=_compact_block_w(OW),
+        BLOCK_R=_COMPACT_BLOCK_R,
+        num_warps=_NUM_WARPS,
+    )
+    return out.view(N, OC, OH, OW)
+
+
+def _use_flat_3d(input, weight, padding, stride, groups, od, oh, ow):
+    """Is the flat 3-D kernel both legal and worth its compaction on this shape?
+
+    Same two questions as _use_flat_2d, and the same answers.  Stride 1 in all
+    three axes, because the constant tap offset is the flat image of
+    ``oh*SH + kh*DH == (oh+kh)*DH``.  A run that actually gets longer, and a
+    compaction that stays small against the x traffic it saves.
+
+    The dtype clause the 2-D gate carries is not here: the 3-D launcher stays in
+    fp32 whatever the input is, so there is no ``_arith_dtype`` arm to be on the
+    wrong side of.  See _flat_conv3d for why.
+    """
+    N, C, D, H, W = input.shape
+    OC, weight_c, _, KH, KW = weight.shape
+    PD, PH, PW = padding
+    SD, SH, SW = stride
+    if SD != 1 or SH != 1 or SW != 1:
+        return False
+    if OC // groups < 1:
+        return False
+    Hp, Wp = H + 2 * PH, W + 2 * PW
+    tot_p = oh * Wp
+    _, block_m = _pick_flat_blocks(OC // groups, tot_p, floor_oc=_DOT_MIN)
+    if block_m < _FLAT_RUN_GAIN * min(ow, _BLOCK_W_MAX):
+        return False
+    if Wp != ow:
+        moved = 2 * (N * OC * od * oh * ow)
+        read = KH * KW * (N * C * (D + 2 * PD) * Hp * Wp)
+        if moved > _FLAT_COMPACT_MAX * read:
+            return False
+    return True
+
+
+def _flat_conv3d(input, weight, padding, dilation, groups):
+    """The flat kernel on a 3-D shape; see _flat_conv3d_kernel.
+
+    fp32 unconditionally, where the 2-D launcher lets the native dtype through
+    on the dot path.  That is the note in _direct_conv3d's own words: the 3-D
+    dot shapes sat at ``tl.dot``'s minimum tile before this, and handing them
+    bf16 measured 2.3-3.0x *slower*.  Flat changes the tile -- BLOCK_M is now
+    the whole (oh, ow) plane, so the cube is operand-bound rather than latency-
+    bound -- but the measurement that says bf16 is safe here has not been made,
+    and the upcast on these volumes is a few hundred KB against a kernel that
+    was 6x its own traffic.  Left as the blocked path had it.
+
+    The output is one ``(OD, OH, Wp)`` slab per channel, compacted back to OW by
+    _compact_plane_kernel.  That kernel wants a plain ``(rows, Wp)`` plane and
+    gets one: within a channel the depth slices are contiguous, so
+    ``(n, oc, od, oh)`` flattens to a row index with stride Wp on its own.
+    """
+    N, C, D, H, W = input.shape
+    OC, weight_c, KD, KH, KW = weight.shape
+    PD, PH, PW = padding
+    DD, DH, DW = dilation
+    Dp, Hp, Wp = D + 2 * PD, H + 2 * PH, W + 2 * PW
+    OD = Dp - DD * (KD - 1)
+    OH = Hp - DH * (KH - 1)
+    OW = Wp - DW * (KW - 1)
+    c_stride = Dp * Hp * Wp
+    h_stride = Hp * Wp
+    tot_p = OH * Wp
+
+    block_oc, block_m = _pick_flat_blocks(
+        OC // groups, tot_p, floor_oc=_DOT_MIN
+    )
+    # Not _pick_block_c: its _UB_TILE_MAX shrink is the *blocked* kernel's
+    # budget, where BLOCK_C * BLOCK_W and the accumulator are spent together.
+    # Here the accumulator is BLOCK_OC * BLOCK_M and the x tile rides alongside
+    # it, exactly as in the 2-D flat kernel, so the only floor that matters is
+    # tl.dot's -- needed for the c_in = 4 shape, whose padded tile is 16.
+    block_c = max(_DOT_MIN, min(_BLOCK_C_MAX, triton.next_power_of_2(weight_c)))
+    n_p = triton.cdiv(tot_p, block_m)
+    c_eff = triton.cdiv(weight_c, block_c) * block_c
+    tail = (
+        (c_eff - weight_c) * c_stride
+        + n_p * block_m
+        + (KD - 1) * DD * h_stride
+        + (KH - 1) * DH * Wp
+        + (KW - 1) * DW
+        + 1
+    )
+    src = _pad_input_flat(input.float(), padding, tail)
+
+    out_plane = OH * Wp
+    out_c_stride = OD * out_plane
+    out_numel = N * OC * out_c_stride
+    out_buf = torch.empty(
+        out_numel + max(_SLACK_ELEMS, n_p * block_m),
+        device=input.device,
+        dtype=input.dtype,
+    )
+    wt = _prep_weight(weight, torch.float32)
+    grid = (n_p, triton.cdiv(OC // groups, block_oc), N * groups * OD)
+    _flat_conv3d_kernel[grid](
+        src,
+        wt,
+        out_buf,
+        groups * weight_c * c_stride,
+        c_stride,
+        h_stride,
+        OC * out_c_stride,
+        out_c_stride,
+        out_plane,
+        tot_p,
+        Wp,
+        weight_c,
+        OC,
+        KD=KD,
+        KH=KH,
+        KW=KW,
+        DD=DD,
+        DH=DH,
+        DW=DW,
+        GROUPS=groups,
+        OD=OD,
+        BLOCK_OC=block_oc,
+        BLOCK_C=block_c,
+        BLOCK_M=block_m,
+        NEED_OCMASK=(OC // groups) % block_oc != 0,
+        NEED_CMASK=weight_c % block_c != 0,
+        num_warps=_NUM_WARPS,
+    )
+    if Wp == OW:
+        return out_buf[:out_numel].view(N, OC, OD, OH, OW)
+
+    rows = N * OC * OD * OH
+    out = torch.empty(N * OC * OD * OH * OW, device=input.device, dtype=input.dtype)
+    bw = _compact_block_w(OW)
+    _compact_plane_kernel[(triton.cdiv(OW, bw), triton.cdiv(rows, _COMPACT_BLOCK_R))](
+        out_buf,
+        out,
+        OW,
+        rows,
+        WP=Wp,
+        BLOCK_W=bw,
+        BLOCK_R=_COMPACT_BLOCK_R,
+        num_warps=_NUM_WARPS,
+    )
+    return out.view(N, OC, OD, OH, OW)
+
 
 def _direct_conv2d(input, weight, padding, stride, dilation, groups):
     N, _, H, W = input.shape
@@ -1618,6 +2654,19 @@ def _direct_conv2d(input, weight, padding, stride, dilation, groups):
     if use_dot and weight_c < _DOT_MIN:
         arith = torch.float32
 
+    # Stride-1 shapes index the plane flat: one tap offset becomes a constant
+    # shift, so the x tile's innermost run is BLOCK_M instead of BLOCK_W.  It is
+    # a separate kernel because that run length is what the blocked form cannot
+    # reach, and it costs a compaction of the Wp-strided result back to OW
+    # columns.  See _flat_conv2d_kernel for the measurements and _use_flat_2d
+    # for when it is not worth taking.
+    if (
+        SH == 1
+        and SW == 1
+        and _use_flat_2d(input, weight, padding, groups, OH, OW, use_dot)
+    ):
+        return _flat_conv2d(input, weight, padding, dilation, groups, arith)
+
     # The halo is only built when the padding is non-zero, which is the only
     # thing that can put a tap outside the input.  A row that is not a whole
     # number of tiles used to need one too, to give the last segment's masked
@@ -1645,19 +2694,83 @@ def _direct_conv2d(input, weight, padding, stride, dilation, groups):
     # with it, so the conv's stride-2 penalty (5.2 ms there) exceeds the
     # transposing copy that buys it back (3.5 ms).  The clause above is right as
     # written: never a loss.
+    # A 1x1 kernel has nothing to permute, and _prep_weight exists to *be* that
+    # permutation rather than to cast.  Its destination is (T, C, OC) because
+    # that is the layout whose innermost axis is the one the kernel walks per
+    # tap; at T == 1 the source's own (OC, C) already has a unit-stride axis of
+    # the same length, so the tile the kernel builds -- ``w[oc, c]`` at
+    # ``oc * W_OC_STRIDE + c * w_c_stride`` -- is one contiguous run of
+    # BLOCK_OC * BLOCK_C elements read straight out of the caller's tensor.
+    # Written into the prepared layout it is BLOCK_C runs of BLOCK_OC, which is
+    # the same bytes in a worse shape.  There is no gather to avoid, because
+    # what makes the native layout a gather is the *tap* axis -- stride KH*KW
+    # in the innermost one -- and at 1x1 that stride is 1.
+    #
+    # So the permutation is skipped, and with it a kernel launch.  That is the
+    # whole win and it is not a small one: the launch is a fixed 2.6 us against
+    # the 3.7 us the convolution itself takes on (4,16,256)/k1, so it is 41% of
+    # that call and takes its speedup from 3.32x to 5.68x -- +0.107 on the
+    # suite's arithmetic mean from one shape, where the whole 1-D halo work
+    # below is worth +0.117 across seven.
+    #
+    # Gated on the dot arm because the FMA arm reads its weight as a vector over
+    # oc, ``tap_w + c * w_c_stride``, and there the unit-stride axis is the one
+    # the permutation creates: indexing that vector by oc through a native
+    # (OC, C) means stride C, a gather per tap per channel.  The masks and the
+    # tile divisibility are required, not preferred: without them a masked lane
+    # computes an address past the end of the *caller's* tensor, which has none
+    # of the slack _prep_weight's own buffer carries -- the mask suppresses the
+    # access, not the address, and the MTE faults on the address first (see
+    # _slack).  With both divisions exact every lane of the tile is in bounds,
+    # masked or not.
+    native_w = (
+        use_dot
+        and KH == 1
+        and KW == 1
+        and groups == 1
+        and arith == weight.dtype
+        and weight.is_contiguous()
+        and weight_c % block_c == 0
+        and (OC // groups) % block_oc == 0
+    )
+    # How far the last segment's masked lanes run past the padded row; the pad
+    # widens the row by that much so their addresses stay inside it.
+    tail = (
+        (triton.cdiv(OW, block_w) * block_w - 1) * SW
+        + (KW - 1) * DW
+        + 1
+        - (W + 2 * PW)
+    )
+    # The weight permutation rides along with the 1-D halo when there is one to
+    # ride along with, and is built on its own otherwise.  Both entries land in
+    # `wt`; only a shape that reached the flat branch can set it here, and only
+    # a shape that still needs a permutation is offered one -- handing the
+    # native arm a weight would buy nothing and still pay for the kernel.
+    # The upcast is not a launch of its own when the halo kernel is going to
+    # write every element anyway.  It costs one there -- a wider store -- where
+    # ``input.to(arith)`` is an aclnnInplaceCopy_CastAiCore of its own: 1.8 us
+    # on [11] against a 9.4 us call and 3.4 us on [7] against 53.1 us, which is
+    # the largest single line in [11]'s profile after the convolution.
+    #
+    # Only the contiguous case folds.  The kernel reads its source as
+    # ``r*W + c``, and the one thing that lets a strided input reach it today is
+    # that ``.to(arith)`` left a contiguous tensor behind on the way; a strided
+    # input keeps that cast, since a source the kernel cannot index is worth
+    # more than the launch it saves.
+    cast_in = arith != input.dtype and input.is_contiguous()
+    wt = None
     if split_w:
         src = _pad_split_cast(input, padding, SW, DW, KW, OW, block_w, arith)
     else:
-        # How far the last segment's masked lanes run past the padded row; the
-        # pad widens the row by that much so their addresses stay inside it.
-        src = _pad_input(
-            input.to(arith),
+        src, wt = _pad_flat_row(
+            input if cast_in else input.to(arith),
             padding,
-            (triton.cdiv(OW, block_w) * block_w - 1) * SW
-            + (KW - 1) * DW
-            + 1
-            - (W + 2 * PW),
+            tail,
+            None if native_w else weight,
+            arith,
         )
+        if src is None:
+            src = _pad_input(input.to(arith), padding, tail)
     in_s = src.stride()
     # The split tensor is (N, C, H, SW, Wq) and the plain one (N, C, H, W); the
     # kernel takes the residue-plane stride separately so both reach the same
@@ -1671,7 +2784,17 @@ def _direct_conv2d(input, weight, padding, stride, dilation, groups):
         dtype=input.dtype,
     )
     output = out_buf[:out_numel].view(N, OC, OH, OW)
-    wt = _prep_weight(weight, arith)
+    # `wt` was set by the pad above when the permutation rode along with it, and
+    # by the native arm when there was no permutation to build at all.  Falling
+    # through both means it still has to be built, in its own launch.
+    if native_w:
+        wt = weight
+        w_oc_stride = weight_c
+    elif wt is None:
+        wt = _prep_weight(weight, arith)
+        w_oc_stride = 1
+    else:
+        w_oc_stride = 1
     out_s = output.stride()
 
     grid = (
@@ -1716,6 +2839,7 @@ def _direct_conv2d(input, weight, padding, stride, dilation, groups):
         USE_DOT=use_dot,
         W_SPLIT=split_w,
         RUNTIME_TAPS=runtime_taps,
+        W_OC_STRIDE=w_oc_stride,
         num_warps=_NUM_WARPS,
     )
     return output
@@ -1733,6 +2857,15 @@ def _direct_conv3d(input, weight, padding, stride, dilation, groups):
 
     block_oc, block_w = _pick_blocks(OW, OC // groups)
     dot_ok = _can_use_dot(block_oc, block_w, weight_c)
+
+    # Widening BLOCK_W past a narrow OW to reach the dot arm was tried here and
+    # is a loss: on (2,16,16,16,16)/k3/s2 -- the suite's only 3-D shape with
+    # OW < _DOT_MIN, where BLOCK_OC is already the whole channel axis -- the
+    # dot arm with a padded 16-wide tile runs the convolution in 219 us against
+    # the FMA arm's 166.  These tiles sit at tl.dot's minimum, the runtime tap
+    # loop gives the cube nothing to pipeline, and 27 dots of (16,16)x(16,16)
+    # come out latency-bound exactly as _DOT_3D describes; the FMA arm's 432
+    # rank-one updates at least keep the vector unit issuing.
 
     # Same depthwise lift as the 2D launcher and for the same reason; see
     # _densify_depthwise.  The 3D variant was missing it, which is why
@@ -1752,6 +2885,14 @@ def _direct_conv3d(input, weight, padding, stride, dilation, groups):
 
     use_dot = dot_ok and _DOT_3D
     block_c = _pick_block_c(weight_c, use_dot, block_w)
+
+    # Stride-1 shapes index the (oh, ow) plane flat, one depth slice per program;
+    # see _flat_conv3d_kernel.  It is the 2-D launcher's move one dimension out,
+    # and it is taken before the halo because it builds a different one -- the
+    # un-widened rows the flat identity needs, not the widened rows the tile
+    # loop needs.
+    if _use_flat_3d(input, weight, padding, stride, groups, OD, OH, OW):
+        return _flat_conv3d(input, weight, padding, dilation, groups)
 
     # Same halo rule as the 2D launcher; see the note there.  The dtype is fp32
     # unconditionally -- not gated on use_dot like the 2D launcher -- and that

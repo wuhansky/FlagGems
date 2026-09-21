@@ -54,51 +54,56 @@ BENCH_DTYPES = [
     #torch.float32,
 ]
 
-# Core cases keep `--level core` fast: one plain convolution plus the deepest
-# branch (depthwise / sub-16 input channels) per dimensionality.
+# Core cases keep `--level core` fast. The split is by measured speedup of this
+# backend's kernel against the vendored conv, taken from
+# benchmark/test_cudnn_convolution_msprof.py at bfloat16: the three fastest cases
+# of each rank are core, everything else is comprehensive-only. The measured
+# speedup is carried in the comment next to each case so the split can be
+# re-derived against a fresh profile instead of guessed at. Cases within a list
+# are ordered by descending speedup.
 CONV1D_CORE_CASES = [
-    ((32, 64, 512), 64, 3, 1, 1, 1, 1),  # baseline
-    ((16, 32, 1024), 32, 3, 1, 1, 1, 32),  # depthwise -> channel padding
+    ((4, 16, 256), 16, 1, 1, 0, 1, 1),  # 1x1 pointwise 5.617
+    ((16, 32, 512), 32, 3, 1, 2, 2, 1),  # dilation 2 2.425
+    ((32, 64, 512), 64, 3, 1, 1, 1, 1),  # baseline 1.987
 ]
 
 CONV1D_MORE_CASES = [
-    ((64, 48, 1024), 128, 5, 2, 2, 1, 1),  # stride 2, kernel 5
-    ((16, 24, 2048), 96, 7, 1, 3, 1, 2),  # grouped, kernel 7
-    ((8, 8, 8192), 16, 11, 4, 5, 1, 1),  # long sequence, large stride
-    ((4, 16, 256), 16, 1, 1, 0, 1, 1),  # 1x1 pointwise
-    ((16, 32, 512), 32, 3, 1, 2, 2, 1),  # dilation 2
-    ((8, 4, 512), 8, 3, 1, 1, 1, 1),  # C_in = 4 < 16 -> channel padding
+    ((16, 32, 1024), 32, 3, 1, 1, 1, 32),  # depthwise -> channel padding 1.737
+    ((8, 4, 512), 8, 3, 1, 1, 1, 1),  # C_in = 4 < 16 -> channel padding 1.605
+    ((16, 24, 2048), 96, 7, 1, 3, 1, 2),  # grouped, kernel 7 1.202
+    ((8, 8, 8192), 16, 11, 4, 5, 1, 1),  # long sequence, large stride 0.914
+    ((64, 48, 1024), 128, 5, 2, 2, 1, 1),  # stride 2, kernel 5 0.544
 ]
 
 CONV2D_CORE_CASES = [
-    ((32, 64, 128, 128), 32, 3, 1, 2, 1, 1),  # resnet stem
-    ((8, 3, 224, 224), 16, 3, 1, 1, 1, 1),  # RGB in, C_in < 16 -> padding
+    ((16, 64, 56, 56), 128, 1, 1, 0, 1, 1),  # 1x1 pointwise 1.202
+    ((8, 256, 64, 64), 256, 3, 1, 1, 1, 1),  # wide channels, compute bound 0.394
+    ((16, 32, 32, 32), 32, 3, 1, 2, 2, 1),  # dilation 2 0.357
 ]
 
 CONV2D_MORE_CASES = [
-    ((32, 64, 210, 210), 16, 5, 2, 1, 1, 1),  # large spatial, kernel 5
-    # ((16, 32, 12, 12), 24, 3, 2, 1, 1, 1),  # small spatial - commented out to reduce CI timeout
-    ((16, 32, 24, 24), 24, 3, 2, 2, 1, 2),  # grouped, stride 2
-    # ((16, 32, 24, 24), 24, 3, 1, 2, 1, 2),  # grouped - commented out to reduce CI timeout
-    ((8, 256, 64, 64), 256, 3, 1, 1, 1, 1),  # wide channels, compute bound
-    ((16, 64, 56, 56), 128, 1, 1, 0, 1, 1),  # 1x1 pointwise
-    ((16, 32, 56, 56), 32, 3, 1, 1, 1, 32),  # depthwise
-    ((16, 32, 32, 32), 32, 3, 1, 2, 2, 1),  # dilation 2
     # asymmetric kernel / stride / padding / dilation
-    ((16, 32, 32, 32), 32, (3, 5), (2, 1), (1, 2), (1, 2), 1),
+    ((16, 32, 32, 32), 32, (3, 5), (2, 1), (1, 2), (1, 2), 1),  # asymmetric 0.350
+    ((32, 64, 128, 128), 32, 3, 1, 2, 1, 1),  # resnet stem 0.331
+    ((16, 32, 56, 56), 32, 3, 1, 1, 1, 32),  # depthwise 0.325
+    ((32, 64, 210, 210), 16, 5, 2, 1, 1, 1),  # large spatial, kernel 5 0.156
+    # ((16, 32, 12, 12), 24, 3, 2, 1, 1, 1),  # small spatial - commented out to reduce CI timeout
+    ((16, 32, 24, 24), 24, 3, 2, 2, 1, 2),  # grouped, stride 2 0.095
+    # ((16, 32, 24, 24), 24, 3, 1, 2, 1, 2),  # grouped - commented out to reduce CI timeout
+    ((8, 3, 224, 224), 16, 3, 1, 1, 1, 1),  # RGB in, C_in < 16 -> padding 0.094
 ]
 
 CONV3D_CORE_CASES = [
-    ((2, 16, 16, 16, 16), 16, 3, 1, 1, 1, 1),  # baseline
+    ((2, 16, 12, 12, 12), 16, 3, 1, 1, 1, 16),  # depthwise -> channel padding 0.521
+    ((2, 16, 16, 16, 16), 16, 3, 1, 1, 1, 1),  # baseline 0.518
+    ((2, 4, 16, 16, 16), 8, 3, 1, 1, 1, 1),  # C_in = 4 < 16 -> padding 0.464
 ]
 
 CONV3D_MORE_CASES = [
-    ((4, 16, 24, 24, 24), 16, 3, 1, 1, 1, 1),  # larger volume
-    ((2, 16, 16, 16, 16), 16, 3, 2, 1, 1, 1),  # stride 2
+    ((4, 16, 24, 24, 24), 16, 3, 1, 1, 1, 1),  # larger volume 0.295
+    ((2, 16, 16, 16, 16), 16, 3, 2, 1, 1, 1),  # stride 2 0.239
     # ((2, 16, 16, 16, 16), 16, 1, 1, 0, 1, 1),  # 1x1x1 pointwise - commented out to reduce CI timeout
     # ((2, 16, 20, 20, 20), 16, 3, 1, 2, 2, 1),  # dilation 2 - commented out to reduce CI timeout
-    ((2, 16, 12, 12, 12), 16, 3, 1, 1, 1, 16),  # depthwise -> channel padding
-    ((2, 4, 16, 16, 16), 8, 3, 1, 1, 1, 1),  # C_in = 4 < 16 -> padding
 ]
 
 
