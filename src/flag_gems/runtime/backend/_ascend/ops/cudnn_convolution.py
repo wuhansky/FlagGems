@@ -1802,11 +1802,19 @@ def _flat_conv2d_kernel(
         run     256 B   512 B   1024 B   2048 B
         GB/s      382     623      859     1367
 
-    It is not the number of taps: reading the same tile nine times at offsets of
-    one element costs 0.98x of reading it once, so the taps hit cache.  It is
-    not the number of channels either.  It is the length of the innermost
-    contiguous run, and at W=128/k3/p2 the blocked kernel's run is 2*OW bytes.
-    Flat takes it to BLOCK_M.
+    It is the length of the innermost contiguous run, and at W=128/k3/p2 the
+    blocked kernel's run is 2*OW bytes.  Flat takes it to BLOCK_M.
+
+    The tap count is *not* free, though an isolated measurement says it is.
+    Reading one tile nine times at one-element offsets costs 0.98x of reading it
+    once, but scaling KH*KW over 1/9/25/49 on a fixed shape *inside this kernel*
+    costs 1.00x / 8.75x / 19.83x / 37.61x, with the effective bandwidth pinned at
+    200-240 GB/s instead of rising.  Pinned bandwidth as the tap count grows is
+    what an MTE2-issue bound looks like: the taps are paid for in request slots,
+    not absorbed by cache.  The isolated probe was missing the GM pressure of
+    the real call, in the same way as the ones recorded on _direct_conv2d_kernel
+    -- treat any tile or tap measurement taken outside the whole call as a
+    hypothesis, not a result.
 
     On (32,64,128,128)/oc32/k3/p2 the conv goes 1709 us -> 533 us, 11.7 -> 37.4
     TFLOP/s.  The ceiling is now the cube, not the MTE: 19.9 GFLOP over 533 us.
@@ -1906,6 +1914,15 @@ def _compact_plane_kernel(
     contiguous load and a 1-D contiguous store is 716 us, five times *worse*,
     and the same shape with a per-lane // and % to rebuild the column index is
     55.9 ms.  A strided 2-D tile is the best form available; this is it.
+
+    So do not try to fuse the compaction into the kernel that produces the
+    plane.  Writing ``oh = p // Wp; ow = p - oh * Wp`` into _flat_conv2d_kernel's
+    store is bit-identical to the two-pass form and 633-742x slower on the four
+    flat benchmark cases -- 384448 us against 599 us on (8,256,64,64), 773631
+    against 1043 on (32,64,128,128).  A constexpr divisor does not save it, so
+    the cost is not the division: ``oh * OW + ow`` is not affine in ``p``, the
+    backend can no longer prove the store's stride, and it emits a gather.  Same
+    mechanism as the ``//`` in _prep_weight, one pipe over.
     """
     r = tl.program_id(1) * BLOCK_R + tl.arange(0, BLOCK_R)
     c = tl.program_id(0) * BLOCK_W + tl.arange(0, BLOCK_W)
@@ -2264,16 +2281,26 @@ def _pad_input_flat(input, padding, tail):
             BLOCK_H=BLOCK_H, BLOCK_W=BLOCK_W, num_warps=_NUM_WARPS,
         )
         return out[:numel].view(N, C, *padded)
+    if not any(padding):
+        # No halo to write, only room to leave: one contiguous pass.  The buffer
+        # stays uninitialised because the copy below fills *every* element of
+        # ``out[:numel]`` -- with no padding there is nothing for a zero to
+        # stand in for.  ``torch.zeros`` here is a whole extra write of the
+        # tensor (aclnnInplaceZero 4.5 us on (16,64,56,56)/k1, against a 38 us
+        # call) and the only thing it zeroes is the stretch that the copy is
+        # about to overwrite anyway.  What the allocation is really buying is
+        # ``tail``, the room past the end that the last program's masked-lane
+        # loads point into; those lanes never store, so what they read is
+        # deliberately garbage either way.
+        out = torch.empty(numel + tail, device=input.device, dtype=input.dtype)
+        out[:numel].copy_(input.reshape(-1))
+        return out[:numel].view(N, C, *padded)
     out = torch.zeros(numel + tail, device=input.device, dtype=input.dtype)
     interior = out[:numel].view(N, C, *padded)
-    if any(padding):
-        window = (slice(None), slice(None)) + tuple(
-            slice(p, p + s) for p, s in zip(padding, spatial)
-        )
-        interior[window].copy_(input)
-    else:
-        # No halo to write, only room to leave: one contiguous pass.
-        out[:numel].copy_(input.reshape(-1))
+    window = (slice(None), slice(None)) + tuple(
+        slice(p, p + s) for p, s in zip(padding, spatial)
+    )
+    interior[window].copy_(input)
     return interior
 
 
