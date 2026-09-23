@@ -2837,6 +2837,12 @@ def _use_flat_2d(input, weight, padding, groups, oh, ow, use_dot):
     OC, weight_c, KH, KW = weight.shape
     if KH * KW > _DOT_TAPS_MAX or OC // groups < _DOT_MIN:
         return False
+    # A 1-D shape lifted to H==1 never wins on flat: its blocked run is already
+    # the whole W row (and a depthwise one additionally pays a densify), so the
+    # flat identity only adds the compaction.  Measured, [2] (16,32,512)/d2 and
+    # [10] (16,32,1024)/g32 are 3.3x and 2.4x *slower* on flat.
+    if H == 1:
+        return False
     PH, PW = padding
     wp = W + 2 * PW
     tot_p = oh * wp
@@ -2847,7 +2853,15 @@ def _use_flat_2d(input, weight, padding, groups, oh, ow, use_dot):
     if wp != ow:
         moved = 2 * (N * OC * oh * ow)
         read = KH * KW * (N * C * (H + 2 * PH) * wp)
-        if moved > _FLAT_COMPACT_MAX * read:
+        # A C_in below _DOT_MIN is forced onto the padded-dot path, whose x read
+        # is a C<16 strided gather at ~114 GB/s -- far below the flat byte-rate
+        # the ratio above assumes.  The byte count understates that read's cost
+        # and overstates the compaction's share, so admit a higher ratio there.
+        # [20] (8,3,224,224)/k3 sits at 1.16 and flat wins 1.60x on it; the C_in
+        # >= _DOT_MIN shapes that would also pass at the widened bound are all
+        # 1-D and already refused above, so the tight 0.5 stays for them.
+        cap = 8.0 if weight_c < _DOT_MIN else _FLAT_COMPACT_MAX
+        if moved > cap * read:
             return False
     return True
 
