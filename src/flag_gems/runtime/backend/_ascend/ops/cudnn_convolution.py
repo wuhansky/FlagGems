@@ -369,6 +369,21 @@ _PREP_BLOCK = 64
 # 32 is 1.05, 64 is 0.92.  Swept on the whole call, not assumed.
 _SPLIT_BLOCK_ROWS = 64
 _SPLIT_BLOCK_Q = 128
+# Upper bound on BLOCK_ROWS * next_power_of_2(W) for _fused_split_cast_kernel,
+# which loads a whole (unpadded) input row at once rather than tiling the width
+# like _pad_split_cast_kernel.  A 64 x 512 fp32 tile already needs 3145728 bits
+# against the 1572864-bit unified buffer (see the SW=4 note in
+# _pad_split_cast), so 64 x 256 (16384 elements) is the last whole-row shape that
+# fits; the wide 1-D cases ([8] W=8192, [75] W=1024) stay on the width-tiled
+# kernel.  Measured, not assumed: 64 x 256 compiles, 64 x 512 does not.
+_FUSE_SPLIT_MAX_TILE = 16384
+# Width tile (input columns) for _fused_split_cast_1d_kernel, the 1-D width-tiled
+# sibling of _fused_split_cast_kernel.  Same unified-buffer budget as the
+# whole-row kernel -- BLOCK_ROWS x BLOCK_W must stay under ~16384 fp32 elements
+# (64 x 256 here, the last shape that fits before the tile overflows the
+# 1572864-bit buffer) -- so a wide 1-D row (W=1024) is cut into W/BLOCK_W tiles
+# instead of overflowing like the whole-row load would.
+_FUSE_SPLIT_BLOCK_W = 256
 
 
 def _arith_dtype(input, use_dot, taps, runtime_taps=False):
@@ -448,6 +463,64 @@ def _memset_kernel(out_ptr, numel, BLOCK: tl.constexpr):
     # _direct_conv2d_kernel's note).
     off = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     tl.store(out_ptr + off, 0.0, mask=off < numel)
+
+
+@libentry()
+@triton.jit
+def _memset_prep_kernel(
+    out_ptr,
+    numel,
+    w_ptr,
+    wt_ptr,
+    N_MEMSET: tl.constexpr,
+    GRID1: tl.constexpr,
+    S_OC: tl.constexpr,
+    C: tl.constexpr,
+    OC: tl.constexpr,
+    T: tl.constexpr,
+    OUT_FP32: tl.constexpr,
+    BLOCK: tl.constexpr,
+    BLOCK_OC: tl.constexpr,
+    BLOCK_CT: tl.constexpr,
+):
+    """``_memset_kernel`` and ``_prep_weight_kernel`` in one launch.
+
+    The two bodies are the kernels they replace, joined on the program id: the
+    memset tiles take ``[0, N_MEMSET)`` and the weight tiles the rest.  Same join
+    as _pad_flat_prep_kernel -- the branch must be a real one so the else-arm's
+    ``pid - N_MEMSET`` stays non-negative, and ``GRID1`` is the prep kernel's
+    second axis folded back out with a division by a constant -- applied here to
+    the *split halo's* fill pass instead of the pad's.  The 1-D split halo
+    already pays a full-buffer memset; this rides the weight permutation onto it
+    so the prep's own launch (a fixed ~2.6 us) is saved.  The prep body is
+    _prep_weight_kernel's unchanged, tn/cn naming and all.
+    """
+    pid = tl.program_id(0)
+    if pid < N_MEMSET:
+        off = pid * BLOCK + tl.arange(0, BLOCK)
+        tl.store(out_ptr + off, 0.0, mask=off < numel)
+    else:
+        q = pid - N_MEMSET
+        p0 = q // GRID1
+        p1 = q - p0 * GRID1
+        ct = p0 * BLOCK_CT + tl.arange(0, BLOCK_CT)
+        oc = p1 * BLOCK_OC + tl.arange(0, BLOCK_OC)
+        ct_ok = ct < C * T
+        oc_ok = oc < OC
+        cn = ct // T
+        tn = ct - cn * T
+        wv = tl.load(
+            w_ptr + oc[:, None] * S_OC + ct[None, :],
+            mask=oc_ok[:, None] & ct_ok[None, :],
+            other=0.0,
+        )
+        if OUT_FP32:
+            wv = wv.to(tl.float32)
+        tl.store(
+            wt_ptr + tn[:, None] * (C * OC) + cn[:, None] * OC + oc[None, :],
+            tl.trans(wv),
+            mask=ct_ok[:, None] & oc_ok[None, :],
+        )
 
 
 @libentry()
@@ -1132,7 +1205,345 @@ def _pad_split_cast_kernel(
         tl.store(out_base + 3 * out_r_stride, p3, mask=m)
 
 
-def _pad_split_cast(input, padding, sw, dw, kw, out_w, block_w, arith):
+@libentry()
+@triton.jit
+def _fused_split_cast_kernel(
+    in_ptr,
+    out_ptr,
+    H,
+    W,
+    PH,
+    PW,
+    in_plane_stride,
+    out_plane_stride,
+    out_row_stride,
+    out_r_stride,
+    WQ: tl.constexpr,
+    SW: tl.constexpr,
+    W_POW2: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    CAST_TO_FP32: tl.constexpr,
+):
+    """Split (SW=2/4) + pad + upcast from the *unpadded* input in one pass.
+
+    This is _pad_split_cast_kernel with the halo materialisation folded away: it
+    reads the raw (contiguous) input directly, folds the padding shift into the
+    split-store (plane ``(s+PW)%SW`` at ``q+(s+PW)//SW``), and leaves every border
+    -- top/bottom rows, left/right columns -- to the memset that precedes it in
+    _fused_split_cast.  The load index ``r*W + c`` is affine; the only mask is
+    the block/width overshoot expressed as a *value* mask (other=0), which
+    tl.split carries correctly here, unlike a clamped/non-affine index (see
+    _pad_split_cast_kernel's note).  This removes the zeros+copy_ halo build
+    (1047 us of the (32,64,210,210)/k5/s2 call) at the price of a value-masked
+    load; measured, the net is ~0.76x on that call's split prep.
+    """
+    pid_plane = tl.program_id(0)
+    pid_row = tl.program_id(1)
+    r = pid_row * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    c = tl.arange(0, W_POW2)
+    rm = r < H
+    v = tl.load(
+        in_ptr + pid_plane * in_plane_stride + r[:, None] * W + c[None, :],
+        mask=rm[:, None] & (c < W)[None, :],
+        other=0.0,
+    )
+    if CAST_TO_FP32:
+        v = v.to(tl.float32)
+    q = tl.arange(0, W_POW2 // SW)
+    base = out_ptr + pid_plane * out_plane_stride + (r + PH) * out_row_stride
+    if SW == 2:
+        v = tl.reshape(v, (BLOCK_ROWS, W_POW2 // 2, 2))
+        even, odd = tl.split(v)
+        e_pl = (0 + PW) % 2
+        e_sh = (0 + PW) // 2
+        o_pl = (1 + PW) % 2
+        o_sh = (1 + PW) // 2
+        tl.store(
+            base[:, None] + e_pl * out_r_stride + q[None, :] + e_sh,
+            even,
+            mask=rm[:, None] & (q[None, :] + e_sh < WQ),
+        )
+        tl.store(
+            base[:, None] + o_pl * out_r_stride + q[None, :] + o_sh,
+            odd,
+            mask=rm[:, None] & (q[None, :] + o_sh < WQ),
+        )
+    else:
+        v = tl.reshape(v, (BLOCK_ROWS, W_POW2 // 4, 2, 2))
+        lo, hi = tl.split(v)
+        p0, p2 = tl.split(lo)
+        p1, p3 = tl.split(hi)
+        p0_pl = (0 + PW) % 4
+        p0_sh = (0 + PW) // 4
+        p1_pl = (1 + PW) % 4
+        p1_sh = (1 + PW) // 4
+        p2_pl = (2 + PW) % 4
+        p2_sh = (2 + PW) // 4
+        p3_pl = (3 + PW) % 4
+        p3_sh = (3 + PW) // 4
+        tl.store(
+            base[:, None] + p0_pl * out_r_stride + q[None, :] + p0_sh,
+            p0,
+            mask=rm[:, None] & (q[None, :] + p0_sh < WQ),
+        )
+        tl.store(
+            base[:, None] + p1_pl * out_r_stride + q[None, :] + p1_sh,
+            p1,
+            mask=rm[:, None] & (q[None, :] + p1_sh < WQ),
+        )
+        tl.store(
+            base[:, None] + p2_pl * out_r_stride + q[None, :] + p2_sh,
+            p2,
+            mask=rm[:, None] & (q[None, :] + p2_sh < WQ),
+        )
+        tl.store(
+            base[:, None] + p3_pl * out_r_stride + q[None, :] + p3_sh,
+            p3,
+            mask=rm[:, None] & (q[None, :] + p3_sh < WQ),
+        )
+
+
+@libentry()
+@triton.jit
+def _fused_split_cast_1d_kernel(
+    in_ptr,
+    out_ptr,
+    W,
+    PW,
+    in_row_stride,
+    out_plane_stride,
+    out_r_stride,
+    WQ: tl.constexpr,
+    SW: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+    CAST_TO_FP32: tl.constexpr,
+):
+    """Width-tiled split + pad + upcast from the unpadded 1-D input.
+
+    _fused_split_cast_kernel reads a *whole* input row, which overflows the
+    unified buffer for wide 1-D rows (W=1024 x BLOCK_ROWS=64 fp32 = 2 Mbit).
+    This is the same fold, cut along the width: each program takes BLOCK_W
+    input columns, so the (BLOCK_ROWS, BLOCK_W) fp32 tile stays under the
+    budget.  The 1-D lift gives H == 1 and PH == 0, so the (n, c, h) triple
+    collapses into one flat row axis of N*C rows (the launcher requires
+    W % BLOCK_W == 0 and N*C % BLOCK_ROWS == 0, so the load is mask-free like
+    _pad_split_cast_kernel's, not value-masked like _fused_split_cast_kernel's).
+
+    The pad is folded into the store exactly as in _fused_split_cast_kernel,
+    only the column origin is the tile's ``c0 = pid_w * BLOCK_W`` rather than 0:
+    sub-plane ``s`` (column residue c0 + s mod SW) lands at plane
+    ``(c0+s+PW) % SW``, q-offset ``(c0+s+PW) // SW``.  Both are scalar broadcast
+    offsets onto an affine ``q`` index, so the store stays affine (the +1 shift
+    on the odd sub-plane is free, not a gather).
+    """
+    pid_row = tl.program_id(0)
+    pid_w = tl.program_id(1)
+    r = pid_row * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    c = pid_w * BLOCK_W + tl.arange(0, BLOCK_W)
+    v = tl.load(in_ptr + r[:, None] * in_row_stride + c[None, :])
+    if CAST_TO_FP32:
+        v = v.to(tl.float32)
+    q = tl.arange(0, BLOCK_W // SW)
+    base = out_ptr + r[:, None] * out_plane_stride
+    c0 = pid_w * BLOCK_W
+    if SW == 2:
+        v = tl.reshape(v, (BLOCK_ROWS, BLOCK_W // 2, 2))
+        even, odd = tl.split(v)
+        e_pl = (c0 + 0 + PW) % 2
+        e_sh = (c0 + 0 + PW) // 2
+        o_pl = (c0 + 1 + PW) % 2
+        o_sh = (c0 + 1 + PW) // 2
+        tl.store(
+            base + e_pl * out_r_stride + q[None, :] + e_sh,
+            even,
+            mask=(q[None, :] + e_sh < WQ),
+        )
+        tl.store(
+            base + o_pl * out_r_stride + q[None, :] + o_sh,
+            odd,
+            mask=(q[None, :] + o_sh < WQ),
+        )
+    else:
+        v = tl.reshape(v, (BLOCK_ROWS, BLOCK_W // 4, 2, 2))
+        lo, hi = tl.split(v)
+        p0, p2 = tl.split(lo)
+        p1, p3 = tl.split(hi)
+        p0_pl = (c0 + 0 + PW) % 4
+        p0_sh = (c0 + 0 + PW) // 4
+        p1_pl = (c0 + 1 + PW) % 4
+        p1_sh = (c0 + 1 + PW) // 4
+        p2_pl = (c0 + 2 + PW) % 4
+        p2_sh = (c0 + 2 + PW) // 4
+        p3_pl = (c0 + 3 + PW) % 4
+        p3_sh = (c0 + 3 + PW) // 4
+        tl.store(
+            base + p0_pl * out_r_stride + q[None, :] + p0_sh,
+            p0,
+            mask=(q[None, :] + p0_sh < WQ),
+        )
+        tl.store(
+            base + p1_pl * out_r_stride + q[None, :] + p1_sh,
+            p1,
+            mask=(q[None, :] + p1_sh < WQ),
+        )
+        tl.store(
+            base + p2_pl * out_r_stride + q[None, :] + p2_sh,
+            p2,
+            mask=(q[None, :] + p2_sh < WQ),
+        )
+        tl.store(
+            base + p3_pl * out_r_stride + q[None, :] + p3_sh,
+            p3,
+            mask=(q[None, :] + p3_sh < WQ),
+        )
+
+
+def _fused_split_cast_1d(input, padding, sw, dw, kw, out_w, block_w, arith, weight=None):
+    """The split halo for a 1-D stride-2/4 shape, built from the unpadded input.
+
+    Same zero-then-overwrite shape as _fused_split_cast, specialised to the 1-D
+    lift (H == 1, PH == 0): the row axis is just N*C, the input is a flat
+    (N*C, W) run, and the left/right padding q-columns the split-store leaves
+    behind are zeroed by the flat memset that precedes the kernel.  The width is
+    tiled by BLOCK_W so a wide row (W=1024) does not overflow the unified
+    buffer, which is exactly the case _fused_split_cast's whole-row load cannot
+    take.
+
+    ``weight``, when given, has its ``_prep_weight`` permutation folded onto the
+    memset fill (see _memset_prep_kernel), so the call returns ``(out, wt)`` and
+    the caller skips the prep's own launch.  When it is None the memset is the
+    plain pass and the return is ``(out, None)``.
+    """
+    N, C, H, W = input.shape
+    PH, PW = padding
+    Wp = W + 2 * PW
+    wq = triton.cdiv(Wp, sw)
+    rows = N * C
+    block_rows = _SPLIT_BLOCK_ROWS
+    ow_max = triton.cdiv(out_w, block_w) * block_w - 1 + (kw - 1) * dw // sw
+    tail = ow_max + 1 - wq
+    numel = rows * sw * wq
+    buf = torch.empty(
+        numel + max(_SLACK_ELEMS, tail), device=input.device, dtype=arith
+    )
+    # Full-buffer memset, as in _fused_split_cast.  The border is SW thin strips
+    # strided by wq (q < PW//SW and q >= wq-(W-1+PW)//SW-1), and a strip-only
+    # zero is a strided single-column store -- the backend issues it one lane at
+    # a time, measured slower (7.6 us) than zeroing the whole 12 MB contiguously
+    # (6.2 us).  The interior is overwritten by the split kernel; zeroing it
+    # first is the cheap pass that makes the strided border store unnecessary.
+    wt = None
+    if weight is not None:
+        oc, c = weight.shape[0], weight.shape[1]
+        t = 1
+        for size in weight.shape[2:]:
+            t *= size
+        wt_numel = oc * c * t
+        wt_buf = torch.empty(wt_numel + _SLACK_ELEMS, device=weight.device, dtype=arith)
+        wt = wt_buf[:wt_numel].view(*weight.shape[2:], c, oc)
+        block_ct, block_oc = _prep_blocks(c * t, oc)
+        n_memset = triton.cdiv(buf.numel(), 4096)
+        grid1 = triton.cdiv(oc, block_oc)
+        _memset_prep_kernel[
+            (n_memset + triton.cdiv(c * t, block_ct) * grid1,)
+        ](
+            buf,
+            buf.numel(),
+            weight.contiguous(),
+            wt,
+            N_MEMSET=n_memset,
+            GRID1=grid1,
+            S_OC=c * t,
+            C=c,
+            OC=oc,
+            T=t,
+            OUT_FP32=(arith == torch.float32),
+            BLOCK=4096,
+            BLOCK_OC=block_oc,
+            BLOCK_CT=block_ct,
+            num_warps=_NUM_WARPS,
+        )
+    else:
+        _memset_kernel[(triton.cdiv(buf.numel(), 4096),)](
+            buf, buf.numel(), BLOCK=4096, num_warps=_NUM_WARPS
+        )
+    out = buf[:numel].view(N, C, H, sw, wq)
+    grid = (
+        triton.cdiv(rows, block_rows),
+        triton.cdiv(W, _FUSE_SPLIT_BLOCK_W),
+    )
+    _fused_split_cast_1d_kernel[grid](
+        input,
+        out,
+        W,
+        PW,
+        H * W,  # in_row_stride
+        sw * wq,  # out_plane_stride (Hp == H == 1)
+        wq,  # out_r_stride
+        WQ=wq,
+        SW=sw,
+        BLOCK_ROWS=block_rows,
+        BLOCK_W=_FUSE_SPLIT_BLOCK_W,
+        CAST_TO_FP32=(arith == torch.float32 and input.dtype != torch.float32),
+        num_warps=_NUM_WARPS,
+    )
+    return out, wt
+
+
+def _fused_split_cast(input, padding, sw, dw, kw, out_w, block_w, arith):
+    """The split halo built from the unpadded input, padding folded into the split.
+
+    Zero-fill the whole split buffer (borders + tail) with one flat memset, then
+    _fused_split_cast_kernel overwrites the interior straight from ``input``.
+    The zero-then-overwrite is the same fill-then-copy shape the wide branch of
+    _pad_input rejects *for the halo* (its fill is 1.4 GB); here the fill is the
+    split buffer itself and the copy is replaced by the split, so the pass the
+    vendor pair does not do is the one being eliminated, not added.  SW=2 and
+    SW=4 with any PW < 2*SW are handled by the same plane-rotation rule.
+    """
+    N, C, H, W = input.shape
+    PH, PW = padding
+    Hp = H + 2 * PH
+    Wp = W + 2 * PW
+    wq = triton.cdiv(Wp, sw)
+    block_rows = _SPLIT_BLOCK_ROWS // 2 if sw == 4 else _SPLIT_BLOCK_ROWS
+    ow_max = triton.cdiv(out_w, block_w) * block_w - 1 + (kw - 1) * dw // sw
+    tail = ow_max + 1 - wq
+    numel = N * C * Hp * sw * wq
+    buf = torch.empty(
+        numel + max(_SLACK_ELEMS, tail), device=input.device, dtype=arith
+    )
+    # BLOCK=4096 holds the memset at its ~1.5 TB/s ceiling (BLOCK=1024 is 2.5x
+    # slower); the fill is the one pass this path adds over the vendor pair.
+    _memset_kernel[(triton.cdiv(buf.numel(), 4096),)](
+        buf, buf.numel(), BLOCK=4096, num_warps=_NUM_WARPS
+    )
+    out = buf[:numel].view(N, C, Hp, sw, wq)
+    W_POW2 = triton.next_power_of_2(W)
+    grid = (N * C, triton.cdiv(H, block_rows))
+    _fused_split_cast_kernel[grid](
+        input,
+        out,
+        H,
+        W,
+        PH,
+        PW,
+        H * W,
+        Hp * sw * wq,
+        sw * wq,
+        wq,
+        WQ=wq,
+        SW=sw,
+        W_POW2=W_POW2,
+        BLOCK_ROWS=block_rows,
+        CAST_TO_FP32=(arith == torch.float32 and input.dtype != torch.float32),
+        num_warps=_NUM_WARPS,
+    )
+    return out
+
+
+def _pad_split_cast(input, padding, sw, dw, kw, out_w, block_w, arith, weight=None):
     """Build the split halo from a pre-padded halo, split + upcast in one pass.
 
     The halo is built by ``_pad_input`` (its wide branch is ``torch.zeros`` +
@@ -1142,10 +1553,14 @@ def _pad_split_cast(input, padding, sw, dw, kw, out_w, block_w, arith):
     result is bit-identical to ``_pad_split_width(input.to(arith), ...)`` -- same
     zeros, same cast, same (SW, WQ) layout.  SW=2 and SW=4 are the two width
     strides the benchmark carries; any other stride falls back to _pad_split_width.
+
+    Returns ``(src, wt)``.  ``wt`` is None unless the 1-D fused path both fires
+    and was handed a ``weight`` to permute; ``_direct_conv2d`` threads that
+    weight through so the prep's own launch is skipped on that path.
     """
     N, C, H, W = input.shape
     if sw not in (2, 4):
-        return _pad_split_width(input.to(arith), padding, sw, dw, kw, out_w, block_w)
+        return _pad_split_width(input.to(arith), padding, sw, dw, kw, out_w, block_w), None
     PH, PW = padding
     Hp = H + 2 * PH
     Wp = W + 2 * PW
@@ -1158,6 +1573,36 @@ def _pad_split_cast(input, padding, sw, dw, kw, out_w, block_w, arith):
     # where the buffer is 1572864.  Halving both axes keeps the tile under it.
     block_rows = _SPLIT_BLOCK_ROWS // 2 if sw == 4 else _SPLIT_BLOCK_ROWS
     block_q = _SPLIT_BLOCK_Q // 2 if sw == 4 else _SPLIT_BLOCK_Q
+
+    # Fused path: build the split halo straight from the unpadded input, folding
+    # the pad into the split-store.  This drops the zeros + copy_ halo
+    # materialisation (the largest glue kernel on the stride-2 cases) but needs a
+    # contiguous input and a whole-row load that fits the unified buffer, so the
+    # wide 1-D shapes stay on the width-tiled _pad_split_cast_kernel below.
+    if (
+        sw == 2
+        and input.is_contiguous()
+        and triton.next_power_of_2(W) * block_rows <= _FUSE_SPLIT_MAX_TILE
+    ):
+        return _fused_split_cast(input, padding, sw, dw, kw, out_w, block_w, arith), None
+
+    # 1-D width-tiled fused path: the whole-row load above overflows the unified
+    # buffer for a wide 1-D row (W=1024), so tile the width instead.  Only the
+    # 1-D lift reaches here -- H == 1 and PH == 0 collapse (n, c, h) into N*C
+    # flat rows -- and it needs W a power of two and N*C % BLOCK_ROWS == 0 so the
+    # load stays mask-free (see _fused_split_cast_1d_kernel).  Stride 4 is held
+    # back because the only such case, [8], is already >0.85 and the width-tiled
+    # _pad_split_cast_kernel below is not its bottleneck.
+    if (
+        sw == 2
+        and H == 1
+        and PH == 0
+        and input.is_contiguous()
+        and W > 1
+        and W & (W - 1) == 0
+        and rows % block_rows == 0
+    ):
+        return _fused_split_cast_1d(input, padding, sw, dw, kw, out_w, block_w, arith, weight)
 
     # The furthest column a conv tap can address in the split layout, for the
     # buffer's masked-lane allowance (see _slack); same as _pad_split_width.
@@ -1175,7 +1620,7 @@ def _pad_split_cast(input, padding, sw, dw, kw, out_w, block_w, arith):
     # backend), so rows must divide BLOCK_ROWS and the halo width must cover a
     # whole BLOCK_Q tile.  ROWS that do not divide fall back to _pad_split_width.
     if rows % block_rows != 0:
-        return _pad_split_width(input.to(arith), padding, sw, dw, kw, out_w, block_w)
+        return _pad_split_width(input.to(arith), padding, sw, dw, kw, out_w, block_w), None
     wq_pad = triton.cdiv(wq, block_q) * block_q
     halo = _pad_input(input, padding, wq_pad * sw - Wp).contiguous()
     grid = (rows // block_rows, triton.cdiv(wq, block_q))
@@ -1193,7 +1638,7 @@ def _pad_split_cast(input, padding, sw, dw, kw, out_w, block_w, arith):
         CAST_TO_FP32=(arith == torch.float32 and input.dtype != torch.float32),
         num_warps=_NUM_WARPS,
     )
-    return out
+    return out, None
 
 
 def _pick_blocks(ow, oc_per_group, block_w_cap=None):
@@ -2787,7 +3232,9 @@ def _direct_conv2d(input, weight, padding, stride, dilation, groups):
     cast_in = arith != input.dtype and input.is_contiguous()
     wt = None
     if split_w:
-        src = _pad_split_cast(input, padding, SW, DW, KW, OW, block_w, arith)
+        src, wt = _pad_split_cast(
+            input, padding, SW, DW, KW, OW, block_w, arith, None if native_w else weight
+        )
     else:
         src, wt = _pad_flat_row(
             input if cast_in else input.to(arith),
