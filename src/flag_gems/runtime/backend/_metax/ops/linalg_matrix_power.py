@@ -10,7 +10,11 @@ matmuls use the private _metax_fp64_mm tiled kernel.  The shared hosts
 and matmul below, and the dispatch mirrors the generic NV entry.
 """
 
+import contextlib
+import functools
 import importlib
+import os
+import time
 
 import torch
 import triton
@@ -351,6 +355,7 @@ def _metax_fp64_mm_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     G: tl.constexpr,
+    ACC_FP64: tl.constexpr = True,
 ):
     """Tiled fp64 C = A @ B for MetaX, grid (tiles, batch).
 
@@ -360,6 +365,12 @@ def _metax_fp64_mm_kernel(
     self-contained kernel instead.  Each program computes one BLOCK_M x BLOCK_N
     output tile; the fp64 dot result's rows are un-scrambled with
     ``_metax_fix_fp64_rows`` before the store.
+
+    ``ACC_FP64`` selects the accumulation dtype — fp64 for fp64 inputs (with
+    MetaX's fp64-MMA row permutation un-scrambled), fp32 for fp32 inputs, which
+    matches the generic mm kernel's ``IS_FP64`` policy.  Nothing else changes,
+    so the fp32 tile is a plain fp32 dot that needs no row fix (MetaX scrambles
+    rows only on the fp64 MMA path).
     """
     pid = tl.program_id(0)
     pid_b = tl.program_id(1)
@@ -375,7 +386,7 @@ def _metax_fp64_mm_kernel(
     b_base = B + pid_b * stride_bb
     c_base = C + pid_b * stride_cb
 
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float64)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float64 if ACC_FP64 else tl.float32)
     for k0 in range(0, tl.cdiv(K, BLOCK_K)):
         kr = k0 * BLOCK_K + rk
         a = tl.load(
@@ -388,8 +399,12 @@ def _metax_fp64_mm_kernel(
             mask=(kr[:, None] < K) & (rn[None, :] < N),
             other=0.0,
         )
-        acc += tl.dot(a.to(tl.float64), b.to(tl.float64), allow_tf32=False)
-    acc = _metax_fix_fp64_rows(acc, BLOCK_M, BLOCK_N, G)
+        if ACC_FP64:
+            acc += tl.dot(a.to(tl.float64), b.to(tl.float64), allow_tf32=False)
+        else:
+            acc += tl.dot(a.to(tl.float32), b.to(tl.float32), allow_tf32=False)
+    if ACC_FP64:
+        acc = _metax_fix_fp64_rows(acc, BLOCK_M, BLOCK_N, G)
     cmask = (rm[:, None] < M) & (rn[None, :] < N)
     tl.store(
         c_base + rm[:, None] * stride_cm + rn[None, :] * stride_cn,
@@ -435,6 +450,286 @@ def _metax_fp64_mm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
         num_stages=1,
     )
     return C.reshape(A.shape[:-2] + (M, N))
+
+
+# ===========================================================================
+# Safety layer — keep this operator off the backend's autotuned matmul whenever
+# that path can launch a tile the device cannot run.
+#
+# The backend mm/bmm families autotune a fixed table of tile configs.  A config
+# whose staged A/B tiles exceed the device's per-block shared memory can only
+# fail, and the failure is not always contained: Triton's ``_bench`` swallows
+# ``OutOfResources`` (so the operator just pays a failed compile per benchmark
+# key), but a backend runtime that instead *faults* on the illegal launch
+# poisons the context — after that every later launch/sync blocks and the run
+# sits at that one matmul call for tens of minutes with no output.
+#
+# The check below is read-only (device properties + the backend's published
+# config table) and lives entirely in this operator.  When any tile the call
+# could reach is illegal for this dtype, the operator uses its own fixed-tile,
+# autotune-free matmul (``_mp_mm_safe``) instead.  Knobs:
+#   FLAG_GEMS_MP_MM=auto      default: own kernel only when the table is not legal
+#   FLAG_GEMS_MP_MM=private   always use the operator's own kernel
+#   FLAG_GEMS_MP_MM=backend   always use the backend matmul (fastest, old path)
+#   GEMS_MP_TRACE=<file>      append an fsync'd breadcrumb before every step
+#   GEMS_MP_PRINT_TUNE=1      turn on TRITON_PRINT_AUTOTUNING for the backend mm
+#   FLAG_GEMS_MP_AABS_OFF=1   hold FlagTree AABS off around the dispatch
+# ===========================================================================
+
+_MP_MM_POLICY_ENV = "FLAG_GEMS_MP_MM"
+_MP_TRACE_ENV = "GEMS_MP_TRACE"
+_MP_PRINT_TUNE_ENV = "GEMS_MP_PRINT_TUNE"
+_MP_AABS_ENV = "FLAG_GEMS_MP_AABS_OFF"
+# Config tables the backend matmul can dispatch to for a dense square call.
+_MP_MM_TABLES_2D = ("mm", "mm_nn", "mm_nt")
+_MP_MM_TABLES_3D = ("bmm",)
+# Safety margin on the reported per-block limit (driver/launch overhead).
+_MP_SMEM_FRACTION = 0.9
+_MP_UNSET = object()
+
+
+def _mp_trace(phase, **info):
+    """Append one fsync'd breadcrumb line before a risky step.
+
+    A device-side hang cannot be caught in-process, so the only way to know
+    *which* step wedged is to have written it down before launching it.  Off
+    unless ``GEMS_MP_TRACE`` names a file (triage / CI only), and a tracing
+    failure never fails the operator.
+    """
+    path = os.environ.get(_MP_TRACE_ENV)
+    if not path:
+        return
+    try:
+        with open(path, "a") as handle:
+            fields = " ".join(f"{key}={value}" for key, value in info.items())
+            handle.write(
+                f"{time.time():.3f} pid={os.getpid()} phase={phase} {fields}\n"
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError:
+        pass
+
+
+@functools.lru_cache(maxsize=None)
+def _mp_smem_limit(device_key):
+    """Per-block shared memory of the device, or None when it cannot be read."""
+    try:
+        props = torch.cuda.get_device_properties(device_key)
+        return int(props.shared_memory_per_block)
+    except Exception:
+        # Cannot read the budget -> the caller treats the table as unsafe.
+        return None
+
+
+def _mp_tile(config):
+    """``(BLOCK_M, BLOCK_N, BLOCK_K, stages)`` of a tuned config, else None.
+
+    The dense tables spell the tile ``BLOCK_*``, the bmm table ``TILE_*``;
+    anything else cannot be judged from the table and is reported as unknown.
+    """
+    kwargs = config.kwargs
+    block_m = kwargs.get("BLOCK_M", kwargs.get("TILE_M"))
+    block_n = kwargs.get("BLOCK_N", kwargs.get("TILE_N"))
+    block_k = kwargs.get("BLOCK_K", kwargs.get("TILE_K"))
+    stages = config.num_stages
+    if None in (block_m, block_n, block_k) or not stages:
+        return None
+    return int(block_m), int(block_n), int(block_k), int(stages)
+
+
+@functools.lru_cache(maxsize=None)
+def _mp_table_report(dtype_key, device_key, tables):
+    """``(illegal, total, unknown)`` of the backend's config tables.
+
+    ``illegal`` lists ``(table, config_kwargs, bytes)`` entries whose staged
+    operand tiles exceed the device's per-block shared-memory budget; ``total``
+    counts the entries that could be judged; ``unknown`` is set when any entry
+    (or the device budget itself) could not be inspected.
+    """
+    limit = _mp_smem_limit(device_key)
+    if limit is None:
+        return (), 0, True
+    limit *= _MP_SMEM_FRACTION
+    try:
+        itemsize = torch.empty(0, dtype=getattr(torch, dtype_key)).element_size()
+        from flag_gems import runtime
+
+        tables = tuple((name, runtime.get_tuned_config(name)) for name in tables)
+    except Exception:
+        return (), 0, True
+
+    illegal = []
+    total = 0
+    unknown = False
+    for table, configs in tables:
+        for config in configs:
+            tile = _mp_tile(config)
+            if tile is None:
+                unknown = True
+                continue
+            block_m, block_n, block_k, stages = tile
+            total += 1
+            staged = stages * (block_m * block_k + block_k * block_n) * itemsize
+            if staged > limit:
+                illegal.append((table, dict(config.kwargs), staged))
+    return tuple(illegal), total, unknown
+
+
+def _mp_backend_mm_unsafe(A, B):
+    """Whether the backend matmul is unsafe for this call (conservative).
+
+    fp64 is MetaX's own ``_metax_fp64_mm`` (a fixed tile with no autotuner), so
+    it is always safe here; the fp32 dense/batched tables are the ones that can
+    hold tiles this device cannot run.
+    """
+    if A.dtype == torch.float64:
+        return False
+    if A.dtype != torch.float32:
+        return True  # unexpected dtype: do not launch an unvetted table
+    tables = _MP_MM_TABLES_2D if A.dim() == 2 else _MP_MM_TABLES_3D
+    dtype_key = str(A.dtype).replace("torch.", "")
+    illegal, total, unknown = _mp_table_report(dtype_key, str(A.device), tables)
+    if unknown or total == 0:
+        return True  # cannot prove the table legal -> do not launch it
+    if illegal:
+        # Cached helper -> one warning per process, naming the offending tiles.
+        worst = ", ".join(
+            f"{table}:{kwargs} needs {size / 1024:.0f} KiB"
+            for table, kwargs, size in illegal[:3]
+        )
+        logger.warning(
+            "[linalg_matrix_power] backend matmul tiles exceed this device's "
+            "per-block shared memory for %s (%d of %d table entries): %s%s -> "
+            "using the operator's own fixed-tile matmul; "
+            "FLAG_GEMS_MP_MM=backend forces the autotuned backend matmul",
+            dtype_key,
+            len(illegal),
+            total,
+            worst,
+            " ..." if len(illegal) > 3 else "",
+        )
+        return True
+    return False
+
+
+def _mp_mm_safe(A, B):
+    """Matmul with a fixed, always-legal tile — no autotuner in the path.
+
+    fp64 reuses ``_metax_fp64_mm`` (fixed 64x64x32, ``num_stages=1``); fp32 uses
+    the same tiling with an fp32 accumulator, matching the generic mm kernel's
+    accumulation policy.  A 64x64x32 tile stages 16 KiB of operands per stage,
+    so a single stage fits every MetaX part this operator supports.
+    """
+    if A.dtype == torch.float64:
+        return _metax_fp64_mm(A, B)
+    *_, M, K = A.shape
+    *_, k_b, N = B.shape
+    assert K == k_b, "incompatible dimensions"
+    A2 = A.reshape(-1, M, K)
+    B2 = B.reshape(-1, k_b, N)
+    C = torch.empty(A2.shape[0], M, N, dtype=A.dtype, device=A.device)
+    BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
+    grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), A2.shape[0])
+    _metax_fp64_mm_kernel[grid](
+        A2,
+        B2,
+        C,
+        M,
+        N,
+        K,
+        A2.stride(0),
+        A2.stride(1),
+        A2.stride(2),
+        B2.stride(0),
+        B2.stride(1),
+        B2.stride(2),
+        C.stride(0),
+        C.stride(1),
+        C.stride(2),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        G=BLOCK_M // 16,
+        ACC_FP64=False,
+        num_warps=4,
+        num_stages=1,
+    )
+    return C.reshape(A.shape[:-2] + (M, N))
+
+
+def _mp_mm(A, B, phase):
+    """The operator's single matmul entry point (policy + diagnostics).
+
+    ``auto`` (the default) keeps the operator safe rather than fast: it only
+    hands the call to the backend matmul when every tile that call could reach is
+    legal for the dtype on this device.
+    """
+    policy = os.environ.get(_MP_MM_POLICY_ENV, "auto").strip().lower()
+    if policy not in ("backend", "private"):
+        policy = "auto"
+    use_private = policy == "private"
+    if policy == "auto":
+        try:
+            use_private = _mp_backend_mm_unsafe(A, B)
+        except Exception:
+            # An inspection failure must not mask the matmul: stay conservative.
+            logger.warning(
+                "[linalg_matrix_power] matmul safety check failed; using the "
+                "operator's own fixed-tile matmul",
+                exc_info=True,
+            )
+            use_private = True
+    _mp_trace(
+        "matmul",
+        step=phase,
+        shape=tuple(A.shape),
+        dtype=str(A.dtype),
+        impl="private" if use_private else "backend",
+    )
+    if use_private:
+        return _mp_mm_safe(A, B)
+    if os.environ.get(_MP_PRINT_TUNE_ENV) == "1":
+        os.environ.setdefault("TRITON_PRINT_AUTOTUNING", "1")
+    return _matmul(A, B)
+
+
+try:
+    # Triton < 3.6 has no ``triton.knobs``; vanilla Triton >= 3.6 ships the
+    # module but no AABS, so this probe is False there too.
+    from triton.knobs import autotuning as _mp_autotuning_knobs
+except (ImportError, ModuleNotFoundError):
+    _mp_autotuning_knobs = None
+
+_MP_AABS_PRESENT = _mp_autotuning_knobs is not None and hasattr(
+    _mp_autotuning_knobs, "adjust_block_size"
+)
+
+
+@contextlib.contextmanager
+def _mp_aabs_off():
+    """Optionally hold FlagTree AABS off for the duration of the dispatch.
+
+    AABS rewrites block sizes at launch time by pairing ``tl.cdiv(extent,
+    BLOCK)`` to kernel argument names; a mis-paired shrink can leave a tile
+    below the backend's dot floor and abort the launch (see the same guard in
+    ``flag_gems/ops/cudnn_convolution.py``).  Opt-in here: this operator's own
+    kernels use fixed tiles that are already legal, so the guard is only worth
+    its global-knob write when a tile-shrinking backend pass is suspected.
+    """
+    if not (_MP_AABS_PRESENT and os.environ.get(_MP_AABS_ENV) == "1"):
+        yield
+        return
+    state = _mp_autotuning_knobs.__dict__
+    previous = state.get("adjust_block_size", _MP_UNSET)
+    state["adjust_block_size"] = False
+    try:
+        yield
+    finally:
+        if previous is _MP_UNSET:
+            state.pop("adjust_block_size", None)
+        else:
+            state["adjust_block_size"] = previous
 
 
 @triton.jit
@@ -708,13 +1003,19 @@ def _matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
 # ===========================================================================
 
 
+def _mp_generic_matmul(A, B):
+    """``_generic._matmul`` shim: the generic hosts (inverse / Newton / large-M
+    df64) go through the same safety policy as this module's own calls."""
+    return _mp_mm(A, B, "generic-host")
+
+
 # Hook the shared hosts so every solve/matmul inside the generic hosts runs
 # the metax-fixed kernels (one backend per process - safe).  The large-M LU
 # factorisation (_lu_factor_parallel, generic) resolves _lu_trailing_update_par
 # from its module globals at call time, so swapping it here redirects the
 # fp64 Schur-update dot through the row-un-scrambling kernel above.
 _generic._trsm_solve_2d = _trsm_solve_2d
-_generic._matmul = _matmul
+_generic._matmul = _mp_generic_matmul
 _generic._lu_trailing_update_par = _lu_trailing_update_par
 
 
@@ -724,7 +1025,19 @@ def linalg_matrix_power(
     *,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    """Public entry — the dispatch below plus the operator-local safety layer."""
+    with _mp_aabs_off():
+        return _linalg_matrix_power(A, n, out=out)
+
+
+def _linalg_matrix_power(
+    A: torch.Tensor,
+    n: int,
+    *,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
     logger.debug("GEMS_METAX LINALG_MATRIX_POWER")
+    _mp_trace("entry", shape=tuple(A.shape), n=n, dtype=str(A.dtype))
 
     # ---- validation ----
     shape = A.shape
@@ -785,7 +1098,7 @@ def linalg_matrix_power(
 
     # ---- n == 2, 3: fast paths for large M ----
     if n == 2 and m > TRITON_THRESHOLD:
-        r = _matmul(A, A)
+        r = _mp_mm(A, A, "n2-fast-path")
         if upcast:
             r = r.float()
         if out is not None:
@@ -793,7 +1106,7 @@ def linalg_matrix_power(
             return out
         return r
     if n == 3 and m > TRITON_THRESHOLD:
-        r = _matmul(_matmul(A, A), A)
+        r = _mp_mm(_mp_mm(A, A, "n3-fast-path"), A, "n3-fast-path")
         if upcast:
             r = r.float()
         if out is not None:
@@ -887,10 +1200,10 @@ def linalg_matrix_power(
         n_remaining = n
         while n_remaining > 0:
             if n_remaining & 1:
-                result = z if result is None else _matmul(result, z)
+                result = z if result is None else _mp_mm(result, z, "host-multiply")
             n_remaining >>= 1
             if n_remaining > 0:
-                z = _matmul(z, z)
+                z = _mp_mm(z, z, "host-square")
         if is_batched:
             out_flat.copy_(result)
         else:
